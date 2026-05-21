@@ -2,7 +2,7 @@
 深度学习大作业 - 数据处理模块
 功能：
 1. 读取daily截面数据，合并为面板数据
-2. 过滤ST股、北交所股票（可配置）
+2. 过滤ST股、北交所股票（可配置）；股票池可选 all（默认，以 daily 覆盖为准）/ hs300 / 创业板 / 科创板
 3. 缺失值处理与特征标准化（避免未来信息）
 4. 构造n日收益率标签
 5. 构造滑动窗口样本（过去L天特征 → 未来n日收益）
@@ -15,6 +15,12 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 from typing import List, Tuple, Optional, Dict
+
+
+def _numeric_feature_columns(df: pd.DataFrame) -> List[str]:
+    """返回面板中所有数值列名（稳定排序），用于保留日线全部基础字段。"""
+    cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return sorted(cols)
 
 
 class DataProcessor:
@@ -77,7 +83,9 @@ class DataProcessor:
                   exclude_st: bool = True,
                   exclude_bj: bool = True) -> pd.DataFrame:
         """
-        加载日频数据并过滤股票池
+        加载日频数据并过滤股票池。
+        stock_pool=all 时与作业 PDF 一致：除 ST、北交所以外的全部 A 股（以 basic.csv 登记的非北交所板块为准），
+        再与本地 daily 行取交集；实际只数取决于本地行情覆盖。
         Returns:
             DataFrame: MultiIndex (trade_date, ts_code) 包含所有量价特征
         """
@@ -104,8 +112,16 @@ class DataProcessor:
             raise ValueError("No daily data loaded. Check data path and date range.")
         
         df = pd.concat(all_dfs, ignore_index=True)
-        
-        # 过滤ST股（根据每日ST列表）
+
+        basic_df: Optional[pd.DataFrame] = None
+
+        def _get_basic() -> pd.DataFrame:
+            nonlocal basic_df
+            if basic_df is None:
+                basic_df = pd.read_csv(self.basic_path)
+            return basic_df
+
+        # 过滤ST股（stock_st 文件合并列表；偏保守，等价于剔除「曾出现在 ST 列表」的代码）
         if exclude_st:
             st_files = [f for f in os.listdir(self.st_dir) if f.endswith('.csv')]
             st_codes = set()
@@ -116,7 +132,7 @@ class DataProcessor:
         
         # 过滤北交所（市场类型为北交所的股票）
         if exclude_bj:
-            basic = pd.read_csv(self.basic_path)
+            basic = _get_basic()
             bj_codes = basic[basic['market'] == '北交所']['ts_code'].unique()
             df = df[~df['ts_code'].isin(bj_codes)]
         
@@ -165,15 +181,36 @@ class DataProcessor:
             df = df.merge(comp_df, on=['trade_date', 'ts_code'], how='inner')
             print(f"Filtered to HS300 constituents: {original_len} -> {len(df)} rows")
         elif stock_pool == 'cyb':
-            basic = pd.read_csv(self.basic_path)
+            basic = _get_basic()
             pool_codes = basic[basic['market'] == '创业板']['ts_code'].unique()
             df = df[df['ts_code'].isin(pool_codes)]
         elif stock_pool == 'kcb':
-            basic = pd.read_csv(self.basic_path)
+            basic = _get_basic()
             pool_codes = basic[basic['market'] == '科创板']['ts_code'].unique()
             df = df[df['ts_code'].isin(pool_codes)]
-        # else 'all' 不做额外筛选
-        
+        elif stock_pool == 'all':
+            # 作业 PDF：除 ST、北交所外的所有 A 股上市股票（约 5000）；用 basic 中非北交所板块界定上市范围
+            basic = _get_basic()
+            a_share_codes = set(basic.loc[basic['market'] != '北交所', 'ts_code'].astype(str))
+            before = len(df)
+            df = df[df['ts_code'].astype(str).isin(a_share_codes)]
+            print(
+                "Stock pool: all A-shares (作业比赛范围: basic 主板/创业板/科创板, ∩ daily 行; "
+                f"ST/北交所已按配置过滤) rows {before} -> {len(df)}, n_codes_basic={len(a_share_codes)}"
+            )
+        else:
+            raise ValueError(
+                f"Unknown stock_pool={stock_pool!r}; expected 'all', 'hs300', 'cyb', or 'kcb'."
+            )
+
+        # 日历 end_date 只是上限；缺失的 daily/*.csv 会被跳过，故「实际最后交易日」常早于日历末日
+        if len(df) > 0:
+            loaded_days = sorted(df["trade_date"].astype(str).unique())
+            print(
+                f"[daily] 日历区间内开市日约 {len(trade_dates)} 天；本地实际读到 {len(loaded_days)} 天；"
+                f"面板最后交易日: {loaded_days[-1]}（缺 CSV 的日期不会进入面板）"
+            )
+
         # 设置多重索引
         df = df.set_index(['trade_date', 'ts_code']).sort_index()
         self.df = df
@@ -228,19 +265,32 @@ class DataProcessor:
         return df
     
     def select_features(self, 
-                        base_features: List[str] = None,
-                        add_ta: bool = True) -> List[str]:
+                        base_features: Optional[List[str]] = None,
+                        add_ta: bool = True,
+                        use_all_daily_columns: bool = False) -> List[str]:
         """
         确定最终特征列
         Args:
-            base_features: 基础量价特征，默认为 ['open','high','low','close','vol','pct_chg','vwap']
-            add_ta: 是否添加技术指标
+            base_features: 基础量价特征；若 use_all_daily_columns=True 则忽略此项
+            add_ta: 是否添加技术指标（在基础列之上追加）
+            use_all_daily_columns: True 时保留 load_data 后所有数值型日线字段（如 open…vwap 全列）
         Returns:
             特征列名列表
         """
-        if base_features is None:
+        if self.df is None:
+            raise ValueError("Load data first.")
+
+        if use_all_daily_columns:
+            base_features = _numeric_feature_columns(self.df)
+            if 'close' not in base_features:
+                raise ValueError("数据中缺少 close 列，无法构造标签。")
+        elif base_features is None:
             base_features = ['open', 'high', 'low', 'close', 'vol', 'pct_chg', 'vwap']
         
+        miss = [c for c in base_features if c not in self.df.columns]
+        if miss:
+            raise ValueError(f"以下特征列不存在于数据中: {miss}")
+
         self.df = self.df[base_features].copy()  # 先只保留基础列
         
         if add_ta:
@@ -293,7 +343,8 @@ class DataProcessor:
                          window_len: int = 20,
                          horizon: int = 1,
                          train_date_range: Tuple[str, str] = ('2019-01-01', '2024-12-31'),
-                         val_date_range: Tuple[str, str] = ('2025-01-01', '2025-12-31')) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                         val_date_range: Tuple[str, str] = ('2025-01-01', '2025-12-31'),
+                         allow_empty_val: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         为每只股票生成滑动窗口样本，并按时间划分训练/验证集
         Args:
@@ -302,6 +353,7 @@ class DataProcessor:
             train_date_range: 训练集时间范围 (start, end)
             val_date_range: 验证集时间范围 (start, end)
             min_samples_per_stock: 每只股票至少产生多少个样本，否则丢弃该股票
+            allow_empty_val: True 时允许验证集为空（用于「仅用全历史监督样本训练 + 末日推理」流程）
         Returns:
             X_train, y_train, X_val, y_val (numpy arrays)
         """
@@ -310,8 +362,8 @@ class DataProcessor:
         
         # 确保特征列存在，去除 label 列和索引列
         feature_data = self.df[self.feature_cols].copy()
-        # 处理缺失值：前向填充（每个股票内部）
-        feature_data = feature_data.groupby('ts_code').transform(lambda x: x.ffill().bfill())
+        # 处理缺失值：仅在每只股票时间序列内前向填充（避免 bfill 引入未来信息）
+        feature_data = feature_data.groupby('ts_code').transform(lambda x: x.ffill())
         # 删除仍然含有 NaN 的行（一般是股票上市初期或退市边缘）
         valid_idx = feature_data.notna().all(axis=1)
         self.df = self.df[valid_idx]
@@ -334,13 +386,18 @@ class DataProcessor:
             values = grp[self.feature_cols].values
             labels = grp[self.label_col].values
             
-            # 滑动窗口
-            for i in range(len(dates) - window_len - horizon + 1):
+            # 标签在行 j 上对应未来 horizon 日收益，需 j <= len(dates)-1-horizon，故
+            # i + window_len <= len(dates) - 1 - horizon  →  i < len(dates) - window_len - horizon
+            max_i = len(dates) - window_len - horizon
+            if max_i <= 0:
+                continue
+            for i in range(max_i):
                 # 特征：过去 window_len 天的特征
                 X_seq = values[i:i+window_len, :]
                 # 标签：第 i+window_len 天后的 horizon 日收益（对应日期为 dates[i+window_len]）
                 y_label = labels[i+window_len]   # 因为标签已对齐到第 i+window_len 天的未来收益
-                # 样本日期为窗口的最后一天（即做出预测并可以交易的那一天）
+                # 特征对应 dates[i]..dates[i+window_len-1]；标签贴在行 dates[i+window_len]
+                # （该行收益从该行收盘至未来 horizon 个交易日）
                 sample_date = dates[i+window_len]
                 
                 X_list.append(X_seq)
@@ -364,27 +421,113 @@ class DataProcessor:
                 return d.replace('-', '')
             return str(d)
 
+        def norm_anchor(d) -> str:
+            """样本锚定日统一为 8 位数字字符串，避免与 mask 边界比较时 dtype 不一致。"""
+            s = to_yyyymmdd(str(d))
+            if len(s) >= 8:
+                s = s[:8]
+            if len(s) != 8 or not s.isdigit():
+                raise ValueError(f"无法解析样本锚定日: {d!r}")
+            return s
+
         train_start = to_yyyymmdd(train_date_range[0])
         train_end   = to_yyyymmdd(train_date_range[1])
         val_start   = to_yyyymmdd(val_date_range[0])
         val_end     = to_yyyymmdd(val_date_range[1])
 
-        train_mask = (dates_arr >= train_start) & (dates_arr <= train_end)
-        val_mask   = (dates_arr >= val_start) & (dates_arr <= val_end)
+        dates_norm = np.array([norm_anchor(d) for d in dates_arr])
+        train_mask = (dates_norm >= train_start) & (dates_norm <= train_end)
+        val_mask   = (dates_norm >= val_start) & (dates_norm <= val_end)
         
         X_train, y_train = X[train_mask], y[train_mask]
-        X_val, y_val = X[val_mask], y[val_mask]
-        
+
+        if val_mask.sum() == 0:
+            uniq = sorted(set(dates_norm.tolist()))
+            latest = uniq[-1] if uniq else "（无）"
+            if not allow_empty_val:
+                raise ValueError(
+                    "验证集样本数为 0。"
+                    f" 请求的 val_range=({val_date_range[0]}, {val_date_range[1]}) → [{val_start}, {val_end}]。"
+                    f"\n当前 horizon={horizon} 时，样本锚定日 T 需要未来 {horizon} 个交易日的收盘价计算标签，"
+                    "因此面板中**实际会出现的最晚锚定日**通常比 `daily/` **全局最后一个交易日**早。"
+                    f"\n本次数据中，构造出的最晚锚定日为 **{latest}**。"
+                    "\n若你想以某日 D 作为验证/导出 `pred_score` 的 trade_date，请确保 "
+                    "`--load-end` / `daily/` 已覆盖至 **D 之后至少 horizon 个交易日** "
+                    "（例如 horizon=1 时需存在 **D 的下一交易日** 的日线 CSV）。"
+                    "\n若是「末日推理」训练流程，请使用 train_transformer_baseline.py 的 `--workflow predict-next`。"
+                )
+            X_val = np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32)
+            y_val = np.empty((0, 1), dtype=np.float32)
+            self.val_dates = np.array([], dtype=str)
+            self.val_stocks = np.array([], dtype=str)
+        else:
+            X_val, y_val = X[val_mask], y[val_mask]
+            self.val_dates = dates_norm[val_mask]
+            self.val_stocks = stocks_arr[val_mask]
+
         print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
-        
+
         # 保存样本对应的日期和股票，便于回测
-        self.train_dates = dates_arr[train_mask]
+        self.train_dates = dates_norm[train_mask]
         self.train_stocks = stocks_arr[train_mask]
-        self.val_dates = dates_arr[val_mask]
-        self.val_stocks = stocks_arr[val_mask]
-        
+
         return X_train, y_train, X_val, y_val
     
+    def build_inference_X_at_anchor(self, anchor_date: str, window_len: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        在面板已有截至 anchor 日（含）的行情时，构造「锚定日为 anchor」的输入矩阵，
+        **不要求** anchor 日之后仍有日线（无需 T+1 收盘价即可算标签）。
+        窗口划分与 create_sequences 一致：特征为 dates[j-window_len:j]，导出时的 trade_date 记为 anchor。
+        """
+        if self.label_col not in self.df.columns:
+            raise ValueError("Labels not constructed. Call construct_labels() first.")
+        anchor_s = str(anchor_date).replace("-", "")[:8]
+        if len(anchor_s) != 8 or not anchor_s.isdigit():
+            raise ValueError(f"无效的推理锚定日: {anchor_date!r}，应为 YYYYMMDD 或 YYYY-MM-DD")
+
+        feature_data = self.df[self.feature_cols].copy()
+        feature_data = feature_data.groupby("ts_code").transform(lambda x: x.ffill())
+        valid_idx = feature_data.notna().all(axis=1)
+        df_sub = self.df.loc[valid_idx]
+        feature_data = feature_data.loc[valid_idx]
+        df_clean = df_sub[[self.label_col]].copy()
+        df_clean = pd.concat([df_clean, feature_data], axis=1)
+
+        def norm_day(d) -> str:
+            s = str(d).replace("-", "")[:8]
+            if len(s) != 8 or not s.isdigit():
+                raise ValueError(f"无法解析交易日: {d!r}")
+            return s
+
+        X_list: List[np.ndarray] = []
+        codes: List[str] = []
+
+        grouped = df_clean.groupby("ts_code")
+        for stock, grp in grouped:
+            grp = grp.sort_index(level="trade_date")
+            dates = grp.index.get_level_values("trade_date").unique()
+            values = grp[self.feature_cols].values
+            j = None
+            for idx in range(len(dates)):
+                if norm_day(dates[idx]) == anchor_s:
+                    j = idx
+                    break
+            if j is None:
+                continue
+            if j < window_len:
+                continue
+            X_seq = values[j - window_len : j].astype(np.float32)
+            if not np.isfinite(X_seq).all():
+                continue
+            X_list.append(X_seq)
+            codes.append(str(stock))
+
+        if not X_list:
+            raise ValueError(
+                f"推理锚定日 {anchor_s} 无可用样本：请确认该日在面板内、且每只股票历史长度 ≥ window_len={window_len}。"
+            )
+        return np.stack(X_list, axis=0), np.asarray(codes, dtype=str)
+
     # ==================== 5. 标准化（避免未来信息） ====================
     def fit_standardize(self, X_train: np.ndarray, X_val: np.ndarray = None):
         """
@@ -406,9 +549,12 @@ class DataProcessor:
         X_train_scaled = self.scaler.transform(train_flat).reshape(N, T, F)
         X_val_scaled = None
         if X_val is not None:
-            M, T2, F2 = X_val.shape
-            val_flat = X_val.reshape(-1, F2)
-            X_val_scaled = self.scaler.transform(val_flat).reshape(M, T2, F2)
+            if X_val.shape[0] == 0:
+                X_val_scaled = np.empty((0, T, F), dtype=np.float32)
+            else:
+                M, T2, F2 = X_val.shape
+                val_flat = X_val.reshape(-1, F2)
+                X_val_scaled = self.scaler.transform(val_flat).reshape(M, T2, F2)
         
         return X_train_scaled, X_val_scaled
     
@@ -416,12 +562,14 @@ class DataProcessor:
     def run_pipeline(self,
                      start_date='2022-01-01',
                      end_date='2025-12-31',
-                     stock_pool='hs300',
+                     stock_pool='all',
                      window_len=20,
                      horizon=1,
                      train_range=('2022-01-01', '2024-12-31'),
                      val_range=('2025-01-01', '2025-12-31'),
-                     add_ta=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                     add_ta: bool = True,
+                     use_all_daily_columns: bool = False,
+                     allow_empty_val: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         执行完整数据处理流程
         Returns:
@@ -430,7 +578,7 @@ class DataProcessor:
         # 1. 加载并过滤
         self.load_data(start_date, end_date, stock_pool, exclude_st=True, exclude_bj=True)
         # 2. 特征选择与构造
-        self.select_features(add_ta=add_ta)
+        self.select_features(add_ta=add_ta, use_all_daily_columns=use_all_daily_columns)
         # 3. 构造标签
         self.construct_labels(horizon=horizon, label_type='return')
         # 4. 生成序列
@@ -438,7 +586,8 @@ class DataProcessor:
             window_len=window_len,
             horizon=horizon,
             train_date_range=train_range,
-            val_date_range=val_range
+            val_date_range=val_range,
+            allow_empty_val=allow_empty_val,
         )
         # 5. 标准化
         X_train_scaled, X_val_scaled = self.fit_standardize(X_train, X_val)
@@ -450,17 +599,31 @@ class DataProcessor:
 
 # ==================== 使用示例 ====================
 if __name__ == "__main__":
-    # 配置路径（请根据实际数据存放位置修改）
-    DATA_ROOT = "D:\科大云盘\文件\科大云盘\大作业\A股数据"   # 替换为实际路径
-    
-    processor = DataProcessor(DATA_ROOT)
-    X_train, y_train, X_val, y_val = processor.run_pipeline(
-        start_date='2022-01-01',
-        end_date='2025-12-31',
-        stock_pool='hs300',      # 可选 'all', 'hs300', 'cyb', 'kcb'
-        window_len=20,           # 过去20天
-        horizon=1,               # 预测次日收益
-        train_range=('2022-01-01', '2024-12-31'),
-        val_range=('2025-01-01', '2025-12-31'),
-        add_ta=True
+    import argparse
+
+    parser = argparse.ArgumentParser(description="全市场（默认）或子池 + 日线数据处理示例")
+    parser.add_argument(
+        "--data-root",
+        default=os.environ.get(
+            "DL_DATA_ROOT",
+            "/home/lhr/my_stuff/fundamentals_for_deep_learning/data",
+        ),
+        help="数据根目录（含 daily/, index_weight/, basic.csv 等）",
     )
+    args = parser.parse_args()
+
+    processor = DataProcessor(args.data_root)
+    X_train, y_train, X_val, y_val = processor.run_pipeline(
+        start_date="2022-01-01",
+        end_date="2025-12-31",
+        stock_pool="all",
+        window_len=20,
+        horizon=1,
+        train_range=("2022-01-01", "2024-12-31"),
+        val_range=("2025-01-01", "2025-12-31"),
+        add_ta=False,
+        use_all_daily_columns=True,
+    )
+    print("feature_cols:", processor.feature_cols)
+    print("X_train:", X_train.shape, "y_train:", y_train.shape)
+    print("X_val:", X_val.shape, "y_val:", y_val.shape)
