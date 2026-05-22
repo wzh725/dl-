@@ -24,12 +24,14 @@ def _numeric_feature_columns(df: pd.DataFrame) -> List[str]:
 
 
 class DataProcessor:
-    def __init__(self, data_root: str):
+    def __init__(self, data_root: str, *, verbose: bool = True):
         """
         Args:
             data_root: 数据根目录，应包含 daily/, basic.csv, trade_cal.csv, stock_st/ 等
+            verbose: False 时关闭 tqdm 与信息类 print（供 DDP 非主进程消音）
         """
         self.data_root = data_root
+        self.verbose = bool(verbose)
         self.daily_dir = os.path.join(data_root, 'daily')
         self.basic_path = os.path.join(data_root, 'basic.csv')
         self.trade_cal_path = os.path.join(data_root, 'trade_cal.csv')
@@ -39,6 +41,10 @@ class DataProcessor:
         self.feature_cols = None
         self.label_col = None
         self.scaler = None      # 训练集拟合的标准化器
+    
+    def _vprint(self, *args: object, **kwargs: object) -> None:
+        if self.verbose:
+            print(*args, **kwargs)
     
     def _load_hs300_components(self) -> Dict[str, set]:
         """
@@ -62,7 +68,7 @@ class DataProcessor:
             # 确定股票代码列名
             code_col = 'con_code' if 'con_code' in df.columns else 'ts_code'
             if 'trade_date' not in df.columns or code_col not in df.columns:
-                print(f"Warning: {fname} missing required columns, skipping.")
+                self._vprint(f"Warning: {fname} missing required columns, skipping.")
                 continue
             # 将 trade_date 转换为字符串 YYYYMMDD
             df['trade_date'] = df['trade_date'].astype(str)
@@ -72,7 +78,7 @@ class DataProcessor:
                     components[date] = set()
                 components[date].update(group[code_col].unique())
 
-        print(f"Loaded HS300 components for {len(components)} distinct dates.")
+        self._vprint(f"Loaded HS300 components for {len(components)} distinct dates.")
         return components
         
     # ==================== 1. 数据加载与过滤 ====================
@@ -100,7 +106,7 @@ class DataProcessor:
         
         # 逐日读取daily文件
         all_dfs = []
-        for date in tqdm(trade_dates, desc="Loading daily data"):
+        for date in tqdm(trade_dates, desc="Loading daily data", disable=not self.verbose):
             file_path = os.path.join(self.daily_dir, f"{date}.csv")
             if not os.path.exists(file_path):
                 continue
@@ -179,7 +185,7 @@ class DataProcessor:
             # 内连接过滤
             original_len = len(df)
             df = df.merge(comp_df, on=['trade_date', 'ts_code'], how='inner')
-            print(f"Filtered to HS300 constituents: {original_len} -> {len(df)} rows")
+            self._vprint(f"Filtered to HS300 constituents: {original_len} -> {len(df)} rows")
         elif stock_pool == 'cyb':
             basic = _get_basic()
             pool_codes = basic[basic['market'] == '创业板']['ts_code'].unique()
@@ -194,7 +200,7 @@ class DataProcessor:
             a_share_codes = set(basic.loc[basic['market'] != '北交所', 'ts_code'].astype(str))
             before = len(df)
             df = df[df['ts_code'].astype(str).isin(a_share_codes)]
-            print(
+            self._vprint(
                 "Stock pool: all A-shares (作业比赛范围: basic 主板/创业板/科创板, ∩ daily 行; "
                 f"ST/北交所已按配置过滤) rows {before} -> {len(df)}, n_codes_basic={len(a_share_codes)}"
             )
@@ -206,7 +212,7 @@ class DataProcessor:
         # 日历 end_date 只是上限；缺失的 daily/*.csv 会被跳过，故「实际最后交易日」常早于日历末日
         if len(df) > 0:
             loaded_days = sorted(df["trade_date"].astype(str).unique())
-            print(
+            self._vprint(
                 f"[daily] 日历区间内开市日约 {len(trade_dates)} 天；本地实际读到 {len(loaded_days)} 天；"
                 f"面板最后交易日: {loaded_days[-1]}（缺 CSV 的日期不会进入面板）"
             )
@@ -214,7 +220,7 @@ class DataProcessor:
         # 设置多重索引
         df = df.set_index(['trade_date', 'ts_code']).sort_index()
         self.df = df
-        print(f"Data loaded: {df.index.levshape[0]} dates, {df.index.levshape[1]} stocks")
+        self._vprint(f"Data loaded: {df.index.levshape[0]} dates, {df.index.levshape[1]} stocks")
         return df
     
     # ==================== 2. 特征工程 ====================
@@ -335,7 +341,7 @@ class DataProcessor:
         # 删除未来信息辅助列
         df.drop('future_close', axis=1, inplace=True)
         self.df = df
-        print(f"Label constructed: {self.label_col} (horizon={horizon})")
+        self._vprint(f"Label constructed: {self.label_col} (horizon={horizon})")
         return self.df
     
     # ==================== 4. 滑动窗口与样本构造 ====================
@@ -380,7 +386,7 @@ class DataProcessor:
         stock_info = []
         
         grouped = df_clean.groupby('ts_code')
-        for stock, grp in tqdm(grouped, desc="Creating sequences"):
+        for stock, grp in tqdm(grouped, desc="Creating sequences", disable=not self.verbose):
             grp = grp.sort_index(level='trade_date')  # 按时间升序
             dates = grp.index.get_level_values('trade_date').unique()
             values = grp[self.feature_cols].values
@@ -465,7 +471,7 @@ class DataProcessor:
             self.val_dates = dates_norm[val_mask]
             self.val_stocks = stocks_arr[val_mask]
 
-        print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
+        self._vprint(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
 
         # 保存样本对应的日期和股票，便于回测
         self.train_dates = dates_norm[train_mask]
@@ -531,8 +537,11 @@ class DataProcessor:
     # ==================== 5. 标准化（避免未来信息） ====================
     def fit_standardize(self, X_train: np.ndarray, X_val: np.ndarray = None):
         """
-        使用训练集拟合标准化器，并转换训练集和验证集。
-        对每个特征维度独立标准化，同时对时间序列的每个时刻使用相同的scaler。
+        仅用 **训练集锚定样本**拟合标准化器（将 (N,T,F) 展平为训练时刻上的截面后 fit）。
+        **不得**在未按时间分割的全量(train+验证)或未截断的未来数据上估计均值与方差，否则等价于混入未来截面信息。
+
+        验证集 / 末日推理仅用训练阶段 fit 完的 scaler.transform。
+
         Args:
             X_train: 训练集 (N, window_len, feat_dim)
             X_val: 验证集 (M, window_len, feat_dim)

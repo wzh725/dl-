@@ -1,6 +1,7 @@
 """
 下一交易日：根据持仓状态 + 打分截面 + 次日收盘价（来自 daily CSV），
-推演与 backtest_score_weighted 一致的整手、T+1（locked）、佣金规则，并产出每笔买卖股数。
+推演与 backtest_score_weighted 一致的整手、T+1（locked）、**A 股费用**（印花税、沪市过户、券商佣金）
+与 score_weighted 规则，并产出每笔买卖股数。
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ import numpy as np
 import pandas as pd
 
 from backtest_score_weighted import (
-    _trim_desired_cost_to_budget,
-    _unlock_morning,
+    fees_on_sell_turnover,
     floor_to_lot,
-    score_weights_from_picks_df,
+    score_weighted_buys_for_cash_budget,
+    _unlock_morning,
 )
 
 
@@ -96,6 +97,56 @@ def load_close_map_for_day(data_root: str, trade_date: str) -> Dict[str, float]:
     return dict(zip(df["ts_code"].astype(str), df["close"].astype(np.float64)))
 
 
+def resolve_equity_trade_price_date(
+    data_root: str,
+    logical_trade_date_yyyymmdd: str,
+    *,
+    strict: bool = False,
+) -> Tuple[str, str]:
+    """
+    将「你希望标注的下一交易日」映射到本地实际用于读取收盘价的 CSV 交易日。
+
+    - 存在 daily/{{logical}}.csv → 用当日收盘。
+    - 否则在非 strict 下：取 daily/ 中 **<= logical** 的最近一个交易日的 CSV。
+      适用于数据只到今天、但想把「语义上的次日」仍为 YYYYMMDD 的情境（占位成交近似）。
+
+    返回 (pricing_date_yyyymmdd, stderr_note_or_empty)。
+    strict=True → 必须由 logical 当天的 CSV；否则报错。
+    """
+    d = str(logical_trade_date_yyyymmdd).strip().replace("-", "")
+    if len(d) != 8 or not d.isdigit():
+        raise ValueError(f"非法交易日 logical_trade_date: {logical_trade_date_yyyymmdd!r}")
+
+    fp = Path(data_root) / "daily" / f"{d}.csv"
+    if fp.is_file():
+        return d, ""
+    if strict:
+        raise FileNotFoundError(
+            f"--strict-next-trade-csv：要求行情文件存在但缺失：{fp}"
+        )
+
+    daily_dir = Path(data_root) / "daily"
+    if not daily_dir.is_dir():
+        raise FileNotFoundError(f"daily 目录不存在: {daily_dir}")
+
+    dated = sorted(
+        p.stem for p in daily_dir.glob("*.csv") if len(p.stem) == 8 and p.stem.isdigit()
+    )
+    cand = [x for x in dated if x <= d]
+    if not cand:
+        raise FileNotFoundError(
+            f"未找到不晚于 {d} 的 daily/*.csv（数据根目录：{data_root}）。请补行情或改用已有交易日。"
+        )
+    best = cand[-1]
+    if best == d:
+        return d, ""
+    note = (
+        f"[占位价格] daily/{d}.csv 不存在 → 用「不晚于 {d}」的最近行情日 {best} 的收盘价模拟撮合。"
+        "（数据尚未到车时，用你的历史末尾价近似语义上的次日）"
+    )
+    return best, note
+
+
 class OrderLog:
     def __init__(self) -> None:
         self.rows: List[Dict[str, Any]] = []
@@ -160,51 +211,12 @@ def weighted_allocate_shares(
     picks_df: pd.DataFrame,
     scores_map: Dict[str, float],
     lot_size: int,
-) -> Tuple[Dict[str, int], float]:
-    """按 pred_score 加权分配整手股数；返回 (代码→股数, 买入成交额)。"""
-    if picks_df.empty or budget_cash <= 1e-9:
-        return {}, 0.0
-    weights = score_weights_from_picks_df(picks_df)
-    tradable: List[str] = []
-    tpx: Dict[str, float] = {}
-    for _, row in picks_df.iterrows():
-        code = str(row["ts_code"])
-        px = float(px_map.get(code, float("nan")))
-        if np.isfinite(px) and px > 0:
-            tradable.append(code)
-            tpx[code] = px
-    if not tradable:
-        return {}, 0.0
-    sw = sum(weights.get(c, 0.0) for c in tradable)
-    if sw <= 1e-18:
-        return {}, 0.0
-    wt = {c: weights[c] / sw for c in tradable}
-    nav_mid = budget_cash
-    desired: Dict[str, int] = {}
-    for code in tradable:
-        tgt = floor_to_lot(int(nav_mid * wt[code] / tpx[code]), lot_size)
-        if tgt > 0:
-            desired[code] = tgt
-    desired = _trim_desired_cost_to_budget(desired, tpx, lot_size, nav_mid, scores_map)
-    tmp_locked: Dict[str, int] = {}
-    spent = 0.0
-    remaining = budget_cash
-    for code in tradable:
-        tgt = desired.get(code, 0)
-        if tgt <= 0:
-            continue
-        px = tpx[code]
-        cost = tgt * px
-        if cost > remaining + 1e-6:
-            max_lots = int(remaining // (px * lot_size))
-            tgt = max_lots * lot_size
-            if tgt <= 0:
-                continue
-            cost = tgt * px
-        remaining -= cost
-        spent += cost
-        tmp_locked[code] = tmp_locked.get(code, 0) + tgt
-    return tmp_locked, spent
+    commission_bps: float,
+) -> Tuple[Dict[str, int], float, float]:
+    """按 pred_score 加权分配整手股数；返回 (代码→股数, 买入成交额 gross, 买入侧费用合计)。"""
+    return score_weighted_buys_for_cash_budget(
+        px_map, budget_cash, picks_df, scores_map, lot_size, commission_bps
+    )
 
 
 def simulate_score_weighted_day(
@@ -214,9 +226,9 @@ def simulate_score_weighted_day(
     st: PortfolioState,
     n: int,
     k: int,
-    commission_rate: float,
+    commission_bps: float,
 ) -> Tuple[OrderLog, PortfolioState, float, float, str]:
-    """与 run_backtest 一致：早盘解锁 → 卖光可卖 → 清仓记账 → 按分数加权满仓买入 locked。"""
+    """与 run_backtest 一致：早盘解锁 → 卖光可卖 → 清仓记账 → 按分数加权满仓买入 locked（含 A 股费用）。"""
     log = OrderLog()
     sellable = dict(st.sellable)
     locked = dict(st.locked)
@@ -233,6 +245,7 @@ def simulate_score_weighted_day(
         return log, ps, 0.0, nav, "无候选标的"
 
     turnover_sell = 0.0
+    sell_fees = 0.0
     no_position = sum(sellable.values()) == 0 and sum(locked.values()) == 0
     if not no_position:
         for code in list(sellable.keys()):
@@ -244,13 +257,14 @@ def simulate_score_weighted_day(
             if not np.isfinite(px):
                 continue
             proceeds = qty * px
+            sf = fees_on_sell_turnover(code, proceeds, commission_bps)
             sellable[code] = sh0 - qty
             if sellable[code] <= 0:
                 sellable.pop(code, None)
-            cash += proceeds
+            cash += proceeds - sf
             turnover_sell += proceeds
+            sell_fees += sf
             log.sell(code, qty, px, "score_weighted-清仓可卖")
-
     sellable.clear()
     locked.clear()
 
@@ -260,12 +274,14 @@ def simulate_score_weighted_day(
         ps = PortfolioState(cash, lot_size, sellable, locked, st.commission_bps)
         return log, ps, 0.0, nav_after, "现金不足以建仓"
 
-    tmp_locked, spent = weighted_allocate_shares(px_map, cash, picks_df, scores_map, lot_size)
+    tmp_locked, spent, buy_fees = weighted_allocate_shares(
+        px_map, cash, picks_df, scores_map, lot_size, commission_bps
+    )
+    fee_day = sell_fees + buy_fees
     for code, sh in tmp_locked.items():
         log.buy(code, sh, float(px_map[code]), "score_weighted-建仓")
 
-    fee_day = commission_rate * (turnover_sell + spent)
-    cash = cash - spent - fee_day
+    cash = cash - spent - buy_fees
     locked.update(tmp_locked)
     nav_after = cash + _mv(px_map, sellable, locked)
     ps = PortfolioState(cash=cash, lot_size=lot_size, sellable=sellable, locked=locked, commission_bps=st.commission_bps)
@@ -279,7 +295,7 @@ def run_simulation(
     st: PortfolioState,
     n: int,
     k: int,
-    commission_rate: float,
+    commission_bps: float,
 ) -> Tuple[OrderLog, PortfolioState, float, float, str]:
-    """commission_rate 为小数（如 3bps = 0.0003）。唯一策略：预测分数加权全日换手。"""
-    return simulate_score_weighted_day(panel, px_map, scores_map, st, n, k, commission_rate)
+    """commission_bps 为券商佣金基点（万三=3）；另含卖出印花税、沪市 600xxx 过户费。唯一策略：预测分数加权全日换手。"""
+    return simulate_score_weighted_day(panel, px_map, scores_map, st, n, k, commission_bps)

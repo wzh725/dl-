@@ -17,14 +17,44 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from calendar_trading import fmt_yyyy_mm_dd, next_trading_day_strictly_after, _norm_ymd
-from portfolio_sim import infer_position_mode_from_state_dict
+from portfolio_sim import infer_position_mode_from_state_dict, resolve_equity_trade_price_date
 
 _DL_DIR = Path(__file__).resolve().parent
+
+_PASS_SKIP_TRAIN = "--skip-train"
+
+
+def _sanitize_pass_through_train_argv(train_argv: List[str]) -> Tuple[List[str], bool]:
+    """
+    去掉误传给 train_transformer_baseline.py 的 --skip-train，并修复常见粘连写法
+    「all--skip-train」（实为 --stock-pool all + 本应写在「--」前的 --skip-train）。
+    返回（清洗后的 argv，是否检测到 skip-train 意图）。
+    """
+    want_skip = False
+    out: List[str] = []
+    for tok in train_argv:
+        if tok == _PASS_SKIP_TRAIN:
+            want_skip = True
+            continue
+        if _PASS_SKIP_TRAIN in tok and not tok.startswith("-"):
+            head, sep, tail = tok.partition(_PASS_SKIP_TRAIN)
+            if sep and tail.strip():
+                raise SystemExit(
+                    f"无法理解参数粘连: {tok!r}。"
+                    f"请将 {_PASS_SKIP_TRAIN} 单独写在 workflow 的选项里，且置于「传给训练脚本的 --」之前。"
+                )
+            head_st = head.rstrip("-").strip()
+            want_skip = True
+            if head_st:
+                out.append(head_st)
+            continue
+        out.append(tok)
+    return out, want_skip
 
 
 def _fmt_input_date(s: str) -> str:
@@ -38,7 +68,8 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 
 def _infer_next_trade_date_from_scores_and_daily(data_root: str, scores_path: str) -> str:
-    from next_trade_suggestions import infer_next_trade_date_from_daily, load_scores
+    from backtest_score_weighted import load_scores
+    from next_trade_suggestions import infer_next_trade_date_from_daily
 
     scores = load_scores(scores_path)
     dates = sorted(scores["trade_date"].unique())
@@ -172,6 +203,16 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
     if len(next_d) != 8 or not next_d.isdigit():
         raise SystemExit(f"无效 next_trade_date: {next_d!r}")
 
+    px_date_used, px_note_used = "", ""
+    try:
+        px_date_used, px_note_used = resolve_equity_trade_price_date(
+            data_root,
+            next_d,
+            strict=bool(getattr(ns, "strict_next_trade_csv", False)),
+        )
+    except FileNotFoundError as ex:
+        raise SystemExit(str(ex)) from None
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".csv", delete=False, encoding="utf-8"
     ) as tmp_o:
@@ -205,6 +246,8 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
         ]
         if ns.commission_bps is not None:
             sim_cmd.extend(["--commission-bps", str(ns.commission_bps)])
+        if getattr(ns, "strict_next_trade_csv", False):
+            sim_cmd.append("--strict-next-trade-csv")
         print("[workflow_cli] 下一交易日推演:", " ".join(sim_cmd), flush=True)
         subprocess.run(sim_cmd, check=True)
 
@@ -228,6 +271,8 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             "workflow": "predict-next",
             "input_position_mode": pos,
             "next_trade_date": next_d,
+            "pricing_trade_date": px_date_used,
+            "pricing_trade_date_note": px_note_used or "",
             "score_snapshot_trade_date": str(snap_used),
             "score_snapshot_note": snap_note,
             "score_lag": int(ns.score_lag),
@@ -239,8 +284,9 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
                 "scores_csv": ns.export_scores,
             },
             "notes": (
-                "orders 列为整手买卖指令；成交价假设为下一交易日 daily 收盘价。"
-                "portfolio_after_close 为当日收盘后状态（当日买入在 locked）。"
+                "next_trade_date 为语义上的目标交易日。"
+                "若尚无该日的 daily CSV，pricing_trade_date 为用于读取收盘占位的价格源日（不大于 next_trade_date 的最近文件）。"
+                "orders 为整手撮合；portfolio_after_close 为当日收盘后状态（当日买入在 locked）。"
             ),
         }
 
@@ -311,9 +357,14 @@ def main() -> None:
     pn.add_argument(
         "--next-trade-date",
         default="",
-        help="下一交易日 YYYYMMDD；省略则从 daily/ 推断（须有比打分最后一日更晚的 CSV）",
+        help="语义上的下一交易日 YYYYMMDD；可与 pricing 分列（无当天 CSV 时默认用不大于该日的最近收盘价占位）",
     )
-    pn.add_argument("--skip-train", action="store_true", help="跳过训练，仅基于已有 export-scores 推演")
+    pn.add_argument(
+        "--strict-next-trade-csv",
+        action="store_true",
+        help="要求必须存在 daily/{{--next-trade-date}}.csv；禁止占位",
+    )
+    pn.add_argument("--skip-train", action="store_true", help="跳过训练；勿写在「--」后，勿与 --stock-pool 等粘连")
     pn.add_argument("--n-pool", type=int, default=30, dest="n_pool")
     pn.add_argument("--k-hold", type=int, default=10, dest="k_hold")
     pn.add_argument("--score-lag", type=int, default=1)
@@ -323,7 +374,7 @@ def main() -> None:
     pn.add_argument(
         "train_argv",
         nargs=argparse.REMAINDER,
-        help="传给 train_transformer_baseline.py 的额外参数，前置 --",
+        help="传给 train_transformer_baseline.py；须以 -- 隔开。勿把 --skip-train 写在本段（predict-next 另有 --skip-train）",
     )
 
     args = p.parse_args()
@@ -333,6 +384,22 @@ def main() -> None:
     tv = getattr(args, "train_argv", None) or []
     if tv and tv[0] == "--":
         tv = tv[1:]
+
+    tv, glued_skip_train = _sanitize_pass_through_train_argv(tv)
+    if glued_skip_train and args.cmd == "predict-next":
+        if not getattr(args, "skip_train", False):
+            args.skip_train = True
+            print(
+                "[workflow_cli] 提示：检测到将 --skip-train 粘在其它参数后面或写在「--」之后。"
+                f"已对 argv 解压并启用跳过训练。推荐写法：`… {_PASS_SKIP_TRAIN} -- …`（{_PASS_SKIP_TRAIN} 在「--」前）。",
+                flush=True,
+            )
+    elif glued_skip_train and args.cmd == "backtest":
+        print(
+            f"[workflow_cli] 提示：{_PASS_SKIP_TRAIN} 仅用于 predict-next，已从你的训练额外参数里移除。"
+            "backtest 工作流仍会照常训练后再回测。",
+            flush=True,
+        )
 
     if args.cmd == "backtest":
         cmd_backtest(args, tv)

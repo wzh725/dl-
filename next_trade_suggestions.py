@@ -14,11 +14,11 @@
   - **lot_size**：最小交易单位，A 股通常为 100
   - **sellable**：{ "代码": 股数 } — 当日开盘即可卖的持仓（已不含昨买锁定）
   - **locked**：{ "代码": 股数 } — 昨日收盘前买入、按 T+1 **下一交易日早盘才可卖**的部分
-  - **commission_bps**：佣金基点（可选），若 CLI 也传 `--commission-bps` 则以 CLI 为准
+  - **commission_bps**：券商佣金基点（可选，万三=`3`）；若 CLI 传 `--commission-bps` 则覆盖。印花税 / 沪市过户由脚本另行按规则加收。
 
 从未建仓：`sellable`/`locked` 均写 `{}` 即可。
 
-成交价假设为 **下一交易日 daily/*.csv 中的收盘价**（与回测一致）；不涉及实盘下单接口。
+成交价：优先 **`daily/{{--next-trade-date}}.csv` 收盘价**；若尚无该文件，默认改用 **不大于该日的最近已有 CSV（占位近似）**。与回测一致的整手撮合；不涉及实盘下单接口。
 """
 
 from __future__ import annotations
@@ -31,30 +31,17 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-from backtest_score_weighted import score_weights_from_picks_df
+from backtest_score_weighted import load_scores, score_weights_from_picks_df
 from portfolio_sim import (
     OrderLog,
     PortfolioState,
     load_close_map_for_day,
     load_portfolio_json,
     pick_picks_df,
+    resolve_equity_trade_price_date,
     run_simulation,
     save_portfolio_json,
 )
-
-
-def load_scores(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    need = {"trade_date", "ts_code", "pred_score"}
-    miss = need - set(df.columns)
-    if miss:
-        raise ValueError(f"scores CSV 缺少列: {miss}")
-    df = df.copy()
-    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
-    df["ts_code"] = df["ts_code"].astype(str)
-    df["pred_score"] = pd.to_numeric(df["pred_score"], errors="coerce")
-    df = df.dropna(subset=["pred_score"])
-    return df
 
 
 def load_holdings_csv(path: str) -> Dict[str, int]:
@@ -97,21 +84,38 @@ def score_snapshot_date_for_day(
     trade_day: str,
     score_lag: int,
 ) -> Tuple[str, str]:
-    if score_lag <= 0:
-        if trade_day in sorted_score_dates:
-            return trade_day, "lag=0：使用当日截面（trade_date 与交易日对齐）"
-        return sorted_score_dates[-1], "lag=0：指定/推断的交易日不在 CSV 中且无当日分数 → 暂用最后快照（请补充当日 pred_score）"
+    if not sorted_score_dates:
+        raise ValueError("打分 CSV trade_date 列表为空")
 
-    if trade_day in sorted_score_dates:
+    scores_last = sorted_score_dates[-1]
+
+    if score_lag <= 0:
+        if trade_day and trade_day in sorted_score_dates:
+            return trade_day, "lag=0：使用当日截面（trade_date 与交易日对齐）"
+        return scores_last, "lag=0：使用打分 CSV 中最后一个 trade_date 截面"
+
+    # 语义上的执行日晚于打分文件中最晚截面：仅用历史已产生的 pred_score（典型：末日锚定 20260520 → 推演 20260521）
+    if trade_day and len(trade_day) == 8 and trade_day.isdigit() and trade_day > scores_last:
+        idx = max(0, len(sorted_score_dates) - score_lag)
+        snap = sorted_score_dates[idx]
+        return snap, (
+            f"语义执行日 {trade_day} 晚于打分最后截面 {scores_last}；"
+            f"lag={score_lag} → 使用 trade_date={snap}（与 predict-next 末日推理对齐）"
+        )
+
+    if trade_day and trade_day in sorted_score_dates:
         di = sorted_score_dates.index(trade_day)
         idx = max(0, di - score_lag)
-        return sorted_score_dates[idx], f"lag={score_lag}：交易日位于打分样本内 → 使用 trade_date={sorted_score_dates[idx]} 的截面"
+        snap = sorted_score_dates[idx]
+        return snap, f"lag={score_lag}：执行日在打分枚举内 → trade_date={snap}"
 
     di = len(sorted_score_dates)
     idx = max(0, di - score_lag)
     snap = sorted_score_dates[idx]
-    label = trade_day if trade_day else "假定紧接打分样本之后的首个交易日"
-    return snap, f"下一交易日 {label}（不在 CSV 交易日枚举中）→ lag={score_lag}，使用快照 trade_date={snap}"
+    label = trade_day if trade_day else "（未指定 / 推断）"
+    return snap, (
+        f"执行日线索 {label} 与打分 trade_date 未对齐 → lag={score_lag}，使用 trade_date={snap}"
+    )
 
 
 def print_advisory_summary(
@@ -160,7 +164,17 @@ def main() -> None:
         default="",
         help="portfolio_state.json：现金 + sellable + locked；启用细单模式",
     )
-    parser.add_argument("--commission-bps", type=float, default=None, help="覆盖 state 内 commission_bps")
+    parser.add_argument(
+        "--strict-next-trade-csv",
+        action="store_true",
+        help="必须为当日生成 daily/{{--next-trade-date}}.csv；禁止在无文件时用更早交易日的收盘价占位",
+    )
+    parser.add_argument(
+        "--commission-bps",
+        type=float,
+        default=None,
+        help="覆盖 state JSON 内 commission_bps（券商）；不传则用 state",
+    )
     parser.add_argument("--out-csv", default="", help="摘要模式：写出目标池 CSV")
     parser.add_argument("--out-orders", default="", help="细单模式：写出指令明细 CSV")
     parser.add_argument("--out-next-state", default="", help="细单模式：写出推演收盘后状态 JSON（次日链式）")
@@ -187,7 +201,12 @@ def main() -> None:
         if not (next_d.isdigit() and len(next_d) == 8):
             raise SystemExit("细单模式需要有效的下一交易日 YYYYMMDD（请传 --next-trade-date 或确保 daily/ 可推断）")
 
-        px_map = load_close_map_for_day(args.data_root, next_d)
+        px_date, px_note = resolve_equity_trade_price_date(
+            args.data_root, next_d, strict=args.strict_next_trade_csv
+        )
+        if px_note:
+            print(px_note, flush=True)
+        px_map = load_close_map_for_day(args.data_root, px_date)
         tradable = set(px_map.keys())
         panel = panel[panel["ts_code"].astype(str).isin(tradable)].reset_index(drop=True)
         scores_map = panel.set_index("ts_code")["pred_score"].to_dict()
@@ -201,7 +220,6 @@ def main() -> None:
                 st.sellable[c] = st.sellable.get(c, 0) + sh
 
         cbps = float(args.commission_bps if args.commission_bps is not None else st.commission_bps)
-        commission_rate = cbps / 10000.0
 
         log, ps_end, fee, nav_after, sim_note = run_simulation(
             panel,
@@ -210,13 +228,20 @@ def main() -> None:
             st,
             args.n,
             args.k,
-            commission_rate,
+            cbps,
         )
 
         print("=== 细单模式：下一交易日买卖指令（与回测规则对齐） ===")
-        print(f"下一交易日: {next_d}  |  使用打分快照: {score_snap}  |  {snap_note}")
+        print(
+            f"语义下一交易日: {next_d}  |  用于成交价的 CSV 交易日: {px_date}"
+            + ("（与语义日相同）" if px_date == next_d else "（价格占位说明见上文）")
+        )
+        print(f"使用打分快照: {score_snap}  |  {snap_note}")
         print(f"推演说明: {sim_note}")
-        print(f"佣金: commission_bps={cbps}  →  当日估算佣金 ≈ {fee:.2f} 元")
+        print(
+            f"交易费用（印花税+沪市过户+券商佣金）：commission_bps={cbps}（仅券商）"
+            f"  →  当日估算合计 ≈ {fee:.2f} 元"
+        )
         print(f"推演收盘净值（收盘价计价）≈ {nav_after:.2f} 元；现金余额 ≈ {ps_end.cash:.2f} 元")
         print("\n--- 指令明细（买入当日计入 locked，次日才可卖）---")
         if not log.rows:
@@ -262,8 +287,18 @@ def main() -> None:
 
     tradable: Optional[Set[str]] = None
     if next_d.isdigit() and len(next_d) == 8:
-        tradable = codes_tradable_next_day(args.data_root, next_d)
-        if tradable is not None:
+        tradable_set: Optional[Set[str]] = None
+        try:
+            px_date, px_note = resolve_equity_trade_price_date(
+                args.data_root, next_d, strict=args.strict_next_trade_csv
+            )
+            if px_note:
+                print(px_note, flush=True)
+            tradable_set = codes_tradable_next_day(args.data_root, px_date)
+        except FileNotFoundError as e:
+            raise SystemExit(str(e))
+        if tradable_set is not None:
+            tradable = tradable_set
             panel = panel[panel["ts_code"].astype(str).isin(tradable)].reset_index(drop=True)
             scores_map = panel.set_index("ts_code")["pred_score"].to_dict()
 

@@ -310,6 +310,14 @@ def main() -> None:
     use_ddp, rank, local_rank = ddp_setup()
     main_rank = (not use_ddp) or (rank == 0)
 
+    # 降低 torch 中与正确性无关的 CLI 告警噪声（不改变训练/打分数值）
+    import warnings as _warnings
+
+    _warnings.filterwarnings("ignore", message=r".*enable_nested_tensor.*", category=UserWarning)
+    _warnings.filterwarnings(
+        "ignore", message=r".*barrier\(\): using the device.*", category=UserWarning
+    )
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -355,7 +363,7 @@ def main() -> None:
         else:
             print(f"device={device}")
 
-    processor = DataProcessor(args.data_root)
+    processor = DataProcessor(args.data_root, verbose=main_rank)
     X_train, y_train, X_val, y_val = processor.run_pipeline(
         start_date=start_date,
         end_date=end_date,
@@ -519,7 +527,7 @@ def main() -> None:
         core.eval()
         if args.export_infer_anchor:
             anchor_s = _ymd(args.export_infer_anchor)
-            pinf = DataProcessor(args.data_root)
+            pinf = DataProcessor(args.data_root, verbose=main_rank)
             pinf.load_data(start_date, end_date, args.stock_pool, exclude_st=True, exclude_bj=True)
             pinf.select_features(add_ta=False, use_all_daily_columns=True)
             pinf.construct_labels(horizon=args.horizon)

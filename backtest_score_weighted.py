@@ -9,7 +9,11 @@
   - **唯一策略：预测分数加权**：在当日截面上取分数最高的 **--n** 只作为候选池，再在其中持有分数最高的 **--k** 只；
     组合权重与 **pred_score** 成正比（候选池内减去最小值后归一化，避免负权重）；**每日**清仓可卖仓位后按权重满仓重建。
 
-成交价：当日收盘价；`--commission-bps` 按成交额合计扣除；不含滑点、涨跌停。
+成交价：当日收盘价；费用模型与常见 A 股规则对齐（近似）：
+  - **印花税**：卖出成交金额 × **0.1%**；
+  - **过户费**：**上交所**标的（代码六位以 ``60`` 开头，不含深圳）买卖双方按成交金额 × **万分之六**，**不足 1 元按 1 元**；深圳免收；
+  - **券商佣金**：买卖均按 **`--commission-bps`**（基点）计提，**单笔不足 5 元按 5 元**；为 0 时不计佣金项（仍会收印花税 / 上交所过户）。
+不含滑点、涨跌停撮合限制。
 """
 
 from __future__ import annotations
@@ -104,6 +108,120 @@ def floor_to_lot(shares: int, lot_size: int) -> int:
     return (shares // lot_size) * lot_size
 
 
+# --------- A 股费用（推演用近似；与上交所「60xxxx」过户范围按作业口径）---------
+
+STAMP_DUTY_RATE_SELL = 0.001  # 印花税：股票卖出成交金额千分之一；买入不收
+TRANSFER_SSE_BPS = 6.0  # 过户费（沪市适用）：成交金额万分之六
+TRANSFER_SSE_MIN_FEE_CNY = 1.0
+BROKER_COMMISSION_MIN_FEE_CNY = 5.0
+
+
+def sse_main_stock_for_transfer_fee(ts_code: str) -> bool:
+    """
+    是否按「上交所、代码 60 开头」收取过户费（深圳不收）。
+    使用 ts_code 的点分前六位：600000.SH → True；688xxx.SH → False。
+    """
+    raw = str(ts_code).strip()
+    symbol = raw.split(".")[0] if "." in raw else raw
+    return symbol.startswith("60")
+
+
+def _transfer_fee_sse(amount: float) -> float:
+    if amount <= 1e-12:
+        return 0.0
+    raw = abs(amount) * TRANSFER_SSE_BPS / 10000.0
+    return max(TRANSFER_SSE_MIN_FEE_CNY, raw)
+
+
+def broker_commission_fee(amount: float, commission_bps: float) -> float:
+    if amount <= 1e-12 or commission_bps <= 1e-15:
+        return 0.0
+    raw = abs(amount) * commission_bps / 10000.0
+    return max(BROKER_COMMISSION_MIN_FEE_CNY, raw)
+
+
+def fees_on_sell_turnover(ts_code: str, turnover: float, commission_bps: float) -> float:
+    """单笔卖出合计费用（佣金 + 印花税 + 条件过户）。"""
+    fees = broker_commission_fee(turnover, commission_bps)
+    fees += abs(turnover) * STAMP_DUTY_RATE_SELL
+    if sse_main_stock_for_transfer_fee(ts_code):
+        fees += _transfer_fee_sse(turnover)
+    return float(fees)
+
+
+def fees_on_buy_turnover(ts_code: str, turnover: float, commission_bps: float) -> float:
+    """单笔买入合计费用（佣金 + 条件过户）；无印花税。"""
+    fees = broker_commission_fee(turnover, commission_bps)
+    if sse_main_stock_for_transfer_fee(ts_code):
+        fees += _transfer_fee_sse(turnover)
+    return float(fees)
+
+
+def score_weighted_buys_for_cash_budget(
+    px_map: Dict[str, float],
+    budget_cash: float,
+    picks_df: pd.DataFrame,
+    scores_map: Dict[str, float],
+    lot_size: int,
+    commission_bps: float,
+) -> Tuple[Dict[str, int], float, float]:
+    """
+    按 pred_score 加权分配整手买入；每笔扣佣金/沪市过户。
+    Returns (locked 增量字典, 买入成交额 gross, 买入侧费用合计)
+    """
+    if picks_df.empty or budget_cash <= 1e-9:
+        return {}, 0.0, 0.0
+    weights = score_weights_from_picks_df(picks_df)
+    tradable: List[str] = []
+    tpx: Dict[str, float] = {}
+    for _, row in picks_df.iterrows():
+        code = str(row["ts_code"])
+        px = float(px_map.get(code, float("nan")))
+        if np.isfinite(px) and px > 0:
+            tradable.append(code)
+            tpx[code] = px
+    if not tradable:
+        return {}, 0.0, 0.0
+    sw = sum(weights.get(c, 0.0) for c in tradable)
+    if sw <= 1e-18:
+        return {}, 0.0, 0.0
+    wt = {c: weights[c] / sw for c in tradable}
+    nav_mid = budget_cash
+    desired: Dict[str, int] = {}
+    for code in tradable:
+        tgt = floor_to_lot(int(nav_mid * wt[code] / tpx[code]), lot_size)
+        if tgt > 0:
+            desired[code] = tgt
+    desired = _trim_desired_cost_to_budget(desired, tpx, lot_size, nav_mid, scores_map)
+    tmp_locked: Dict[str, int] = {}
+    spent = 0.0
+    buy_fees_total = 0.0
+    remaining = budget_cash
+    for code in tradable:
+        tgt = desired.get(code, 0)
+        if tgt <= 0:
+            continue
+        px = tpx[code]
+        cost_gross = tgt * px
+        bf = fees_on_buy_turnover(code, cost_gross, commission_bps)
+        while cost_gross + bf > remaining + 1e-6 and tgt >= lot_size:
+            tgt -= lot_size
+            cost_gross = tgt * px
+            bf = fees_on_buy_turnover(code, cost_gross, commission_bps)
+        if tgt <= 0:
+            continue
+        cost_gross = tgt * px
+        bf = fees_on_buy_turnover(code, cost_gross, commission_bps)
+        total_out = cost_gross + bf
+        if total_out > remaining + 1e-6:
+            continue
+        remaining -= total_out
+        spent += cost_gross
+        buy_fees_total += bf
+        tmp_locked[code] = tmp_locked.get(code, 0) + tgt
+    return tmp_locked, spent, buy_fees_total
+
+
 def _unlock_morning(sellable: Dict[str, int], locked: Dict[str, int]) -> None:
     """T+1：上一交易日收盘买入的 locked，在本交易日开始时可卖。"""
     codes = set(sellable) | set(locked)
@@ -195,7 +313,7 @@ def run_backtest(
     k: int,
     lot_size: int = 100,
     score_lag: int = 1,
-    commission_rate: float = 0.0,
+    commission_bps: float = 0.0,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     STRATEGY = "score_weighted"
     dates = sorted(scores["trade_date"].unique())
@@ -228,6 +346,7 @@ def run_backtest(
         turnover_buy_: float = np.nan,
         commission_: float = 0.0,
     ) -> dict:
+        # 「commission」列：印花税 + 过户（沪市 60xxxx） + 券商佣金（按 commission_bps）当日合计（元）
         return {
             "trade_date": d_,
             "nav": nav_,
@@ -256,51 +375,17 @@ def run_backtest(
         budget_cash: float,
         picks_df: pd.DataFrame,
         scores_map_local: Dict[str, float],
-    ) -> Tuple[Dict[str, int], float]:
-        """用 budget_cash 按分数加权买入（整手），返回 (locked 增量, 买入成交额)。"""
-        if picks_df.empty or budget_cash <= 1e-9:
-            return {}, 0.0
-        weights = score_weights_from_picks_df(picks_df)
-        tradable: List[str] = []
+    ) -> Tuple[Dict[str, int], float, float]:
+        """用 budget_cash 按分数加权买入（整手）；返回 (locked 增量, 买入成交额 gross, 买入侧费用合计)。"""
         px_map: Dict[str, float] = {}
         for _, row in picks_df.iterrows():
             code = str(row["ts_code"])
             px = close_on(trade_day, code)
             if np.isfinite(px) and px > 0:
-                tradable.append(code)
                 px_map[code] = float(px)
-        if not tradable:
-            return {}, 0.0
-        sw = sum(weights.get(c, 0.0) for c in tradable)
-        if sw <= 1e-18:
-            return {}, 0.0
-        wt = {c: weights[c] / sw for c in tradable}
-        nav_mid = budget_cash
-        desired: Dict[str, int] = {}
-        for code in tradable:
-            tgt = floor_to_lot(int(nav_mid * wt[code] / px_map[code]), lot_size)
-            if tgt > 0:
-                desired[code] = tgt
-        desired = _trim_desired_cost_to_budget(desired, px_map, lot_size, nav_mid, scores_map_local)
-        tmp_locked: Dict[str, int] = {}
-        spent = 0.0
-        remaining = budget_cash
-        for code in tradable:
-            tgt = desired.get(code, 0)
-            if tgt <= 0:
-                continue
-            px = px_map[code]
-            cost = tgt * px
-            if cost > remaining + 1e-6:
-                max_lots = int(remaining // (px * lot_size))
-                tgt = max_lots * lot_size
-                if tgt <= 0:
-                    continue
-                cost = tgt * px
-            remaining -= cost
-            spent += cost
-            tmp_locked[code] = tmp_locked.get(code, 0) + tgt
-        return tmp_locked, spent
+        return score_weighted_buys_for_cash_budget(
+            px_map, budget_cash, picks_df, scores_map_local, lot_size, commission_bps
+        )
 
     for di, d in enumerate(dates):
         _unlock_morning(sellable, locked)
@@ -338,6 +423,7 @@ def run_backtest(
             continue
 
         turnover_sell = 0.0
+        sell_fees = 0.0
         no_position = sum(sellable.values()) == 0 and sum(locked.values()) == 0
         if not no_position:
             for code in list(sellable.keys()):
@@ -349,11 +435,13 @@ def run_backtest(
                 if not np.isfinite(px):
                     continue
                 proceeds = qty * px
+                sf = fees_on_sell_turnover(code, proceeds, commission_bps)
                 sellable[code] = sh0 - qty
                 if sellable[code] <= 0:
                     sellable.pop(code, None)
-                cash += proceeds
+                cash += proceeds - sf
                 turnover_sell += proceeds
+                sell_fees += sf
 
         sellable.clear()
         locked.clear()
@@ -363,9 +451,9 @@ def run_backtest(
             rows.append(_curve_row(d, nav_before, cash, 0, score_date_=score_date))
             continue
 
-        tmp_locked, spent = _weighted_buy_with_cash(d, cash, picks_df, scores_map)
-        fee_day = commission_rate * (turnover_sell + spent)
-        cash = cash - spent - fee_day
+        tmp_locked, spent, buy_fees = _weighted_buy_with_cash(d, cash, picks_df, scores_map)
+        fee_day = sell_fees + buy_fees
+        cash = cash - spent - buy_fees
         locked.update(tmp_locked)
         nav_after = cash + _mv_shares(close_on, d, sellable, locked)
         rows.append(
@@ -401,7 +489,11 @@ def run_backtest(
         "lot_size": float(lot_size),
         "score_lag": float(score_lag),
         "strategy": STRATEGY,
-        "commission_rate": float(commission_rate),
+        "broker_commission_bps": float(commission_bps),
+        "fee_model_cn_a_note": (
+            "stamp_sell_rate=0.1%; transfer_sse=万6 min1 CNY per leg on 600xxx.SH; "
+            "broker_commission=min(5,max) from bps on each leg"
+        ),
         "total_commission": comm_sum,
     }
     return curve, stats
@@ -441,7 +533,10 @@ def main() -> None:
         "--commission-bps",
         type=float,
         default=0.0,
-        help="佣金（基点）：当日成交额合计 × (bps/10000)，从现金扣除；0 表示不计佣金",
+        help=(
+            "券商佣金（基点）；单笔不足 5 元按 5 元；买卖均收取。另自动计：卖出印花税千分之一；"
+            "上交所 600xxx 过户万分之六单笔不足 1 元按 1 元。为 0 则仅印花税/沪市过户。"
+        ),
     )
     parser.add_argument(
         "--benchmark",
@@ -467,7 +562,7 @@ def main() -> None:
         args.k,
         lot_size=args.lot_size,
         score_lag=args.score_lag,
-        commission_rate=args.commission_bps / 10000.0,
+        commission_bps=float(args.commission_bps),
     )
 
     if not args.no_benchmark:
