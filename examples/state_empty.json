@@ -1,0 +1,9 @@
+{
+  "_说明": "未建仓示例：开盘后无持仓可卖、sellable/locked 为空。传给 next_trade_suggestions.py --state 或 workflow_cli.py predict-next --state-in。成交价仍按脚本约定取下一交易日 daily 收盘价。",
+  "position_status": "empty",
+  "cash": 1000000.0,
+  "lot_size": 100,
+  "sellable": {},
+  "locked": {},
+  "commission_bps": 3.0
+}

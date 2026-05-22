@@ -1,0 +1,14 @@
+{
+  "_说明": "已建仓示例：sellable=当日开盘即可卖；locked=昨买仍锁、下一交易日早盘并入可卖（与回测 T+1 一致）。",
+  "position_status": "holding",
+  "cash": 200000.0,
+  "lot_size": 100,
+  "sellable": {
+    "000001.SZ": 300,
+    "600000.SH": 200
+  },
+  "locked": {
+    "002594.SZ": 100
+  },
+  "commission_bps": 3.0
+}
