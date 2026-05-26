@@ -123,6 +123,7 @@ def resolve_equity_trade_price_date(
     - 存在 daily/{{logical}}.csv → 用当日成交价列。
     - 否则在非 strict 下：取 daily/ 中 **<= logical** 的最近一个交易日的 CSV。
       适用于数据只到今天、但想把「语义上的次日」仍为 YYYYMMDD 的情境（占位成交近似）。
+      若请求列为 open，则显式采用“前一可用交易日 close 近似次日 open”。
 
     返回 (pricing_date_yyyymmdd, stderr_note_or_empty)。
     strict=True → 必须由 logical 当天的 CSV；否则报错。
@@ -154,11 +155,34 @@ def resolve_equity_trade_price_date(
     best = cand[-1]
     if best == d:
         return d, ""
-    note = (
-        f"[占位价格] daily/{d}.csv 不存在 → 用「不晚于 {d}」的最近行情日 {best} 的 {price_col} 价模拟撮合。"
-        "（数据尚未到车时，用你的历史末尾价近似语义上的次日）"
-    )
+    if str(price_col) == "open":
+        note = (
+            f"[占位价格] daily/{d}.csv 不存在 → 显式采用「{best} 的 close」近似语义日 {d} 的 open。"
+            "（即“次日开盘≈前日收盘”的近似规则）"
+        )
+    else:
+        note = (
+            f"[占位价格] daily/{d}.csv 不存在 → 用「不晚于 {d}」的最近行情日 {best} 的 {price_col} 价模拟撮合。"
+            "（数据尚未到车时，用你的历史末尾价近似语义上的次日）"
+        )
     return best, note
+
+
+def effective_trade_price_col(
+    requested_price_col: str,
+    logical_trade_date: str,
+    pricing_trade_date: str,
+) -> str:
+    """
+    当请求 open 且语义日 CSV 不存在时，按“次日开盘≈前日收盘”规则回退到 close。
+    其余场景保持请求列不变。
+    """
+    req = str(requested_price_col)
+    logical = str(logical_trade_date)
+    pricing = str(pricing_trade_date)
+    if req == "open" and logical and pricing and logical != pricing:
+        return "close"
+    return req
 
 
 class OrderLog:
@@ -513,12 +537,17 @@ def main() -> None:
             strict=args.strict_next_trade_csv,
             price_col=str(args.trade_price_col),
         )
+        price_col_used = effective_trade_price_col(
+            str(args.trade_price_col),
+            str(next_d),
+            str(px_date),
+        )
         if px_note:
             print(px_note, flush=True)
         px_map = load_trade_price_map_for_day(
             args.data_root,
             px_date,
-            price_col=str(args.trade_price_col),
+            price_col=str(price_col_used),
         )
         tradable = set(px_map.keys())
         panel = panel[panel["ts_code"].astype(str).isin(tradable)].reset_index(drop=True)
@@ -554,6 +583,7 @@ def main() -> None:
             f"语义下一交易日: {next_d}  |  用于成交价的 CSV 交易日: {px_date}"
             + ("（与语义日相同）" if px_date == next_d else "（价格占位说明见上文）")
         )
+        print(f"成交价列: 请求={args.trade_price_col}；实际使用={price_col_used}")
         print(f"使用打分快照: {score_snap}  |  {snap_note}")
         print(f"推演说明: {sim_note}")
         print(
@@ -561,7 +591,7 @@ def main() -> None:
             f"  →  当日估算合计 ≈ {fee:.2f} 元"
         )
         print(
-            f"推演净值（按 {args.trade_price_col} 价计价）≈ {nav_after:.2f} 元；"
+            f"推演净值（按 {price_col_used} 价计价）≈ {nav_after:.2f} 元；"
             f"现金余额 ≈ {ps_end.cash:.2f} 元"
         )
         print("\n--- 指令明细（买入当日计入 locked，次日才可卖）---")
@@ -616,12 +646,17 @@ def main() -> None:
                 strict=args.strict_next_trade_csv,
                 price_col=str(args.trade_price_col),
             )
+            price_col_used = effective_trade_price_col(
+                str(args.trade_price_col),
+                str(next_d),
+                str(px_date),
+            )
             if px_note:
                 print(px_note, flush=True)
             tradable_set = codes_tradable_next_day(
                 args.data_root,
                 px_date,
-                price_col=str(args.trade_price_col),
+                price_col=str(price_col_used),
             )
         except FileNotFoundError as e:
             raise SystemExit(str(e))

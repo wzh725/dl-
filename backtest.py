@@ -543,6 +543,7 @@ def score_weights_from_picks_df(picks_df: pd.DataFrame) -> Dict[str, float]:
 def run_backtest(
     scores: pd.DataFrame,
     trade_price_lut: Dict[Tuple[str, str], float],
+    close_price_lut: Optional[Dict[Tuple[str, str], float]],
     initial_cash: float,
     n: int,
     k: int,
@@ -555,17 +556,25 @@ def run_backtest(
     if len(dates) < 1:
         raise ValueError("交易日数量过少，无法回测。")
 
+    close_price_lut = close_price_lut or {}
+
     cash = float(initial_cash)
     sellable: Dict[str, int] = {}
     locked: Dict[str, int] = {}
     last_trade_px: Dict[str, float] = {}
+    last_close_px: Dict[str, float] = {}
 
     def trade_px_on(d_: str, code: str) -> float:
         key = (d_, code)
+        ckey = (d_, code)
+        if ckey in close_price_lut:
+            last_close_px[code] = close_price_lut[ckey]
         if key in trade_price_lut:
             c = trade_price_lut[key]
             last_trade_px[code] = c
             return c
+        if code in last_close_px:
+            return float(last_close_px[code])
         return float(last_trade_px.get(code, np.nan))
 
     rows: List[dict] = []
@@ -851,12 +860,18 @@ def main() -> None:
         dates,
         price_col=str(args.trade_price_col),
     )
+    close_price_lut = load_trade_price_lookup(
+        args.data_root,
+        dates,
+        price_col="close",
+    )
     if not trade_price_lut:
         raise RuntimeError("未能加载任何撮合价格；请检查 --data-root 与 --trade-price-col。")
 
     curve, stats = run_backtest(
         scores,
         trade_price_lut,
+        close_price_lut,
         args.cash,
         args.n,
         args.k,
@@ -865,6 +880,8 @@ def main() -> None:
         commission_rate=float(args.commission_rate),
     )
     stats["trade_price_col"] = str(args.trade_price_col)
+    if str(args.trade_price_col) == "open":
+        stats["open_missing_fallback_rule"] = "fallback_to_latest_available_close"
 
     if not args.no_benchmark:
         bench_ret = load_benchmark_daily_returns(args.data_root, args.benchmark)

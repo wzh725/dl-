@@ -28,6 +28,7 @@ from data_preprocess import (
     resolve_data_root,
 )
 from predict import (
+    effective_trade_price_col,
     infer_position_mode_from_state_dict,
     infer_next_trade_date_from_daily,
     resolve_equity_trade_price_date,
@@ -280,6 +281,11 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             "input_position_mode": pos,
             "next_trade_date": next_d,
             "pricing_trade_date": px_date_used,
+            "pricing_price_col": effective_trade_price_col(
+                str(ns.trade_price_col),
+                str(next_d),
+                str(px_date_used),
+            ),
             "pricing_trade_date_note": px_note_used or "",
             "score_snapshot_trade_date": str(snap_used),
             "score_snapshot_note": snap_note,
@@ -293,7 +299,9 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             },
             "notes": (
                 "next_trade_date 为语义上的目标交易日。"
-                "若尚无该日的 daily CSV，pricing_trade_date 为用于读取成交价占位的价格源日（不大于 next_trade_date 的最近文件）。"
+                "若尚无该日的 daily CSV，且请求成交价列为 open，"
+                "则显式采用“前一可用交易日 close 近似次日 open”；"
+                "pricing_trade_date 记录该占位价格源日。"
                 "orders 为整手撮合；portfolio_after_close 为当日收盘后状态（当日买入在 locked）。"
             ),
         }
@@ -380,7 +388,7 @@ def main() -> None:
     pn.add_argument(
         "--train-end",
         required=True,
-        help="仍可计算标签的最后锚定日（通常为面板末日的前一交易日，当 horizon=1）",
+        help="仍可计算标签的最后锚定日（通常为面板末日往前 horizon 个交易日，例如默认 horizon=3）",
     )
     pn.add_argument(
         "--export-scores",

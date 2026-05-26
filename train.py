@@ -573,8 +573,8 @@ def main() -> None:
             "默认 --export-infer-anchor auto（面板末日推理打分 → 次日操作建议）"
         ),
     )
-    parser.add_argument("--window-len", type=int, default=20)
-    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--window-len", type=int, default=60)
+    parser.add_argument("--horizon", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=3e-4)
