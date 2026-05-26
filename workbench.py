@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-统一入口：两种工作流
+工作台统一入口：`data_preprocess` / `train` / `backtest` / `predict` 分列模块，本脚本负责编排子进程。
 
-1) backtest：训练（train-end）→ 从「训练截止日的下一交易日」到 backtest-end 的监督打分 → 历史回测
-2) predict-next：用可监督样本尽可能训满 + 面板末日推理打分 → 读持仓 JSON → 写出「下一步操作」JSON
+1) backtest：训练（train-end）→ 验证段打分 → 历史回测  
+2) predict-next：末日推理打分 → 读持仓 JSON → 写出下一步操作 JSON
 
-示例见 README「workflow_cli」小节。
+详见 README「workbench」小节。
 """
 
 from __future__ import annotations
@@ -21,17 +21,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from calendar_trading import fmt_yyyy_mm_dd, next_trading_day_strictly_after, _norm_ymd
-from portfolio_sim import infer_position_mode_from_state_dict, resolve_equity_trade_price_date
+from data_preprocess import (
+    fmt_yyyy_mm_dd,
+    next_trading_day_strictly_after,
+    normalize_trade_calendar_key,
+    resolve_data_root,
+)
+from predict import (
+    infer_position_mode_from_state_dict,
+    infer_next_trade_date_from_daily,
+    resolve_equity_trade_price_date,
+    score_snapshot_date_for_day,
+)
 
 _DL_DIR = Path(__file__).resolve().parent
 
 _PASS_SKIP_TRAIN = "--skip-train"
 
 
+def _train_command(launcher: str, nproc: int, inner: List[str]) -> List[str]:
+    """拼装训练进程：torchrun 或 python + train.py。"""
+    script_path = str(_DL_DIR / "train.py")
+    if launcher == "torchrun":
+        return ["torchrun", "--standalone", f"--nproc_per_node={nproc}", script_path, *inner]
+    return [sys.executable, script_path, *inner]
+
+
 def _sanitize_pass_through_train_argv(train_argv: List[str]) -> Tuple[List[str], bool]:
     """
-    去掉误传给 train_transformer_baseline.py 的 --skip-train，并修复常见粘连写法
+    去掉误传给 train.py 的 --skip-train，并修复常见粘连写法
     「all--skip-train」（实为 --stock-pool all + 本应写在「--」前的 --skip-train）。
     返回（清洗后的 argv，是否检测到 skip-train 意图）。
     """
@@ -46,7 +64,7 @@ def _sanitize_pass_through_train_argv(train_argv: List[str]) -> Tuple[List[str],
             if sep and tail.strip():
                 raise SystemExit(
                     f"无法理解参数粘连: {tok!r}。"
-                    f"请将 {_PASS_SKIP_TRAIN} 单独写在 workflow 的选项里，且置于「传给训练脚本的 --」之前。"
+                    f"请将 {_PASS_SKIP_TRAIN} 单独写在工作台的选项里，且置于「传给 train.py 的 --」之前。"
                 )
             head_st = head.rstrip("-").strip()
             want_skip = True
@@ -68,8 +86,7 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 
 def _infer_next_trade_date_from_scores_and_daily(data_root: str, scores_path: str) -> str:
-    from backtest_score_weighted import load_scores
-    from next_trade_suggestions import infer_next_trade_date_from_daily
+    from backtest import load_scores
 
     scores = load_scores(scores_path)
     dates = sorted(scores["trade_date"].unique())
@@ -86,17 +103,30 @@ def _infer_next_trade_date_from_scores_and_daily(data_root: str, scores_path: st
 
 def cmd_backtest(ns: argparse.Namespace, train_argv: List[str]) -> None:
     data_root = ns.data_root
-    train_end_norm = _norm_ymd(ns.train_end)
-    backtest_end_norm = _norm_ymd(ns.backtest_end)
-    val_start_d = next_trading_day_strictly_after(train_end_norm, data_root)
+    train_end_norm = normalize_trade_calendar_key(ns.train_end)
+    backtest_end_norm = normalize_trade_calendar_key(ns.backtest_end)
+
+    vs_raw = (getattr(ns, "val_start", "") or "").strip()
+    if vs_raw:
+        val_start_d = normalize_trade_calendar_key(vs_raw)
+        if train_end_norm >= val_start_d:
+            raise SystemExit(
+                f"因果约束：`train-end` ({train_end_norm}) 必须严格早于 `--val-start` ({val_start_d})。"
+            )
+    else:
+        val_start_d = next_trading_day_strictly_after(train_end_norm, data_root)
+
     if val_start_d > backtest_end_norm:
         raise SystemExit(
-            f"回测结束日 {backtest_end_norm} 早于首个可行验证锚定日 {val_start_d}（训练截止下一交易日）。"
-            "请增大 --backtest-end 或减小 --train-end。"
+            f"`--backtest-end` ({backtest_end_norm}) 不能早于验证起点 ({val_start_d})；"
+            "请核对 train-end / val-start（若手写）区间。"
         )
 
-    train_cmd: List[str] = []
-    script_path = str(_DL_DIR / "train_transformer_baseline.py")
+    print(
+        f"[workbench] 验证打分锚定: {fmt_yyyy_mm_dd(val_start_d)} .. {fmt_yyyy_mm_dd(backtest_end_norm)}",
+        flush=True,
+    )
+
     inner: List[str] = [
         "--workflow",
         "backtest",
@@ -112,30 +142,15 @@ def cmd_backtest(ns: argparse.Namespace, train_argv: List[str]) -> None:
         fmt_yyyy_mm_dd(backtest_end_norm),
         "--export-scores",
         ns.scores_out,
+        *train_argv,
     ]
-    inner.extend(train_argv)
-
-    if ns.launcher == "torchrun":
-        train_cmd.extend(
-            [
-                "torchrun",
-                "--standalone",
-                f"--nproc_per_node={ns.nproc}",
-                script_path,
-            ]
-        )
-        train_cmd.extend(inner)
-    else:
-        train_cmd.append(sys.executable)
-        train_cmd.append(script_path)
-        train_cmd.extend(inner)
-
-    print("[workflow_cli] 训练 + 验证导出:", " ".join(train_cmd), flush=True)
+    train_cmd = _train_command(ns.launcher, ns.nproc, inner)
+    print("[workbench] 训练 + 验证导出:", " ".join(train_cmd), flush=True)
     subprocess.run(train_cmd, check=True)
 
     bt_cmd = [
         sys.executable,
-        str(_DL_DIR / "backtest_score_weighted.py"),
+        str(_DL_DIR / "backtest.py"),
         "--scores",
         ns.scores_out,
         "--data-root",
@@ -152,14 +167,16 @@ def cmd_backtest(ns: argparse.Namespace, train_argv: List[str]) -> None:
         str(ns.k_hold),
         "--score-lag",
         str(ns.score_lag),
-        "--commission-bps",
-        str(ns.commission_bps),
+        "--trade-price-col",
+        str(ns.trade_price_col),
+        "--commission-rate",
+        str(ns.commission_rate),
     ]
     if ns.no_benchmark:
         bt_cmd.append("--no-benchmark")
-    print("[workflow_cli] 历史回测:", " ".join(bt_cmd), flush=True)
+    print("[workbench] 历史回测:", " ".join(bt_cmd), flush=True)
     subprocess.run(bt_cmd, check=True)
-    print(f"[workflow_cli] 完成。净值: {ns.out_curve} ；摘要: {ns.out_summary}", flush=True)
+    print(f"[workbench] 完成。净值: {ns.out_curve} ；摘要: {ns.out_summary}", flush=True)
 
 
 def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
@@ -168,8 +185,6 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
     pos = infer_position_mode_from_state_dict(raw_state)
 
     if not ns.skip_train:
-        train_cmd: List[str] = []
-        script_path = str(_DL_DIR / "train_transformer_baseline.py")
         inner = [
             "--workflow",
             "predict-next",
@@ -181,21 +196,13 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             _fmt_input_date(ns.train_end),
             "--export-scores",
             ns.export_scores,
+            *train_argv,
         ]
-        inner.extend(train_argv)
-        if ns.launcher == "torchrun":
-            train_cmd.extend(
-                ["torchrun", "--standalone", f"--nproc_per_node={ns.nproc}", script_path]
-            )
-            train_cmd.extend(inner)
-        else:
-            train_cmd.append(sys.executable)
-            train_cmd.append(script_path)
-            train_cmd.extend(inner)
-        print("[workflow_cli] 训练（predict-next）:", " ".join(train_cmd), flush=True)
+        train_cmd = _train_command(ns.launcher, ns.nproc, inner)
+        print("[workbench] 训练（predict-next）:", " ".join(train_cmd), flush=True)
         subprocess.run(train_cmd, check=True)
     else:
-        print("[workflow_cli] 跳过训练，使用已有 scores:", ns.export_scores, flush=True)
+        print("[workbench] 跳过训练，使用已有 scores:", ns.export_scores, flush=True)
 
     next_d = (ns.next_trade_date or "").strip().replace("-", "")
     if not next_d:
@@ -209,6 +216,7 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             data_root,
             next_d,
             strict=bool(getattr(ns, "strict_next_trade_csv", False)),
+            price_col=str(ns.trade_price_col),
         )
     except FileNotFoundError as ex:
         raise SystemExit(str(ex)) from None
@@ -224,7 +232,7 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
     try:
         sim_cmd = [
             sys.executable,
-            str(_DL_DIR / "next_trade_suggestions.py"),
+            str(_DL_DIR / "predict.py"),
             "--scores",
             ns.export_scores,
             "--data-root",
@@ -239,16 +247,18 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             str(ns.k_hold),
             "--score-lag",
             str(ns.score_lag),
+            "--trade-price-col",
+            str(ns.trade_price_col),
             "--out-orders",
             orders_path,
             "--out-next-state",
             next_state_tmp,
         ]
-        if ns.commission_bps is not None:
-            sim_cmd.extend(["--commission-bps", str(ns.commission_bps)])
+        if ns.commission_rate is not None:
+            sim_cmd.extend(["--commission-rate", str(ns.commission_rate)])
         if getattr(ns, "strict_next_trade_csv", False):
             sim_cmd.append("--strict-next-trade-csv")
-        print("[workflow_cli] 下一交易日推演:", " ".join(sim_cmd), flush=True)
+        print("[workbench] 下一交易日推演:", " ".join(sim_cmd), flush=True)
         subprocess.run(sim_cmd, check=True)
 
         orders_rows: List[Dict[str, Any]] = []
@@ -263,8 +273,6 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
 
         scores = pd.read_csv(ns.export_scores)
         dates = sorted(scores["trade_date"].astype(str).str.replace("-", "", regex=False).unique())
-        from next_trade_suggestions import score_snapshot_date_for_day
-
         snap_used, snap_note = score_snapshot_date_for_day(dates, next_d, int(ns.score_lag))
 
         out_payload = {
@@ -285,7 +293,7 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
             },
             "notes": (
                 "next_trade_date 为语义上的目标交易日。"
-                "若尚无该日的 daily CSV，pricing_trade_date 为用于读取收盘占位的价格源日（不大于 next_trade_date 的最近文件）。"
+                "若尚无该日的 daily CSV，pricing_trade_date 为用于读取成交价占位的价格源日（不大于 next_trade_date 的最近文件）。"
                 "orders 为整手撮合；portfolio_after_close 为当日收盘后状态（当日买入在 locked）。"
             ),
         }
@@ -294,7 +302,7 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
         outp.parent.mkdir(parents=True, exist_ok=True)
         with open(outp, "w", encoding="utf-8") as f:
             json.dump(out_payload, f, ensure_ascii=False, indent=2)
-        print(f"[workflow_cli] 已写下一步操作 JSON: {outp}", flush=True)
+        print(f"[workbench] 已写下一步操作 JSON: {outp}", flush=True)
     finally:
         try:
             os.unlink(orders_path)
@@ -307,17 +315,32 @@ def cmd_predict_next(ns: argparse.Namespace, train_argv: List[str]) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="深度学习作业：统一工作流 CLI")
+    p = argparse.ArgumentParser(description="深度学习作业：工作台 CLI（编排 train / backtest / predict）")
     subs = p.add_subparsers(dest="cmd", required=True)
 
-    pb = subs.add_parser("backtest", help="训练 → 验证段打分 → 历史回测（验证起点=训练截止的下一交易日）")
+    pb = subs.add_parser(
+        "backtest",
+        help="训练 → 验证段打分 → 历史回测（默认验证起点=train-end 下一开市日，可用 --val-start 覆盖）",
+    )
     pb.add_argument("--data-root", default=os.environ.get("DL_DATA_ROOT", ""))
     pb.add_argument("--train-start", required=True, help="训练锚定起始 YYYY-MM-DD / YYYYMMDD")
-    pb.add_argument("--train-end", required=True, help="训练锚定结束（含）；回测截面从下一交易日开始")
+    pb.add_argument(
+        "--train-end",
+        required=True,
+        help="训练锚定结束（含）；未写 --val-start 时验证起点为其下一开市日",
+    )
+    pb.add_argument(
+        "--val-start",
+        default="",
+        help=(
+            "可选。验证 / 导出打分首日锚定（YYYY-MM-DD / YYYYMMDD），须严格晚于 train-end。"
+            "用于按「日历」指定回测窗口（如 2026-01-02）；实际有样本的日期仍受 trade_cal 与 daily/ 限制。"
+        ),
+    )
     pb.add_argument(
         "--backtest-end",
         required=True,
-        help="回测 / 打分导出的最后锚定日（含），对应验证 val-end",
+        help="回测 / 打分导出的最后锚定日（含），对应训练侧 --val-end",
     )
     pb.add_argument("--scores-out", default="outputs/workflow_backtest_scores.csv")
     pb.add_argument("--out-curve", default="outputs/workflow_equity_curve.csv")
@@ -326,14 +349,26 @@ def main() -> None:
     pb.add_argument("--n-pool", type=int, default=30, dest="n_pool")
     pb.add_argument("--k-hold", type=int, default=10, dest="k_hold")
     pb.add_argument("--score-lag", type=int, default=1)
-    pb.add_argument("--commission-bps", type=float, default=0.0)
+    pb.add_argument(
+        "--trade-price-col",
+        choices=("open", "close"),
+        default="open",
+        help="回测撮合价格列（默认 open，满足每日开盘买卖）",
+    )
+    pb.add_argument("--commission-rate", type=float, default=0.0002)
+    pb.add_argument(
+        "--commission-bps",
+        type=float,
+        default=None,
+        help="兼容旧参数：基点制（万三=3），若提供则覆盖 --commission-rate",
+    )
     pb.add_argument("--no-benchmark", action="store_true")
     pb.add_argument("--launcher", choices=("python", "torchrun"), default="python")
     pb.add_argument("--nproc", type=int, default=1, help="torchrun 时每机进程数（GPU 数）")
     pb.add_argument(
         "train_argv",
         nargs=argparse.REMAINDER,
-        help="传给 train_transformer_baseline.py 的额外参数，前置 -- ，例如: -- --epochs 3 --batch-size 512",
+        help="传给 train.py 的额外参数，前置 -- ，例如: -- --epochs 3 --batch-size 512",
     )
 
     pn = subs.add_parser(
@@ -350,14 +385,14 @@ def main() -> None:
     pn.add_argument(
         "--export-scores",
         default="outputs/workflow_predict_next_scores.csv",
-        help="训练写出 pred_score；predict-next 也用它喂给 next_trade_suggestions",
+        help="训练写出 pred_score；predict-next 也用它喂给 predict.py",
     )
     pn.add_argument("--state-in", required=True, help="账户 JSON（示例见 examples/）")
     pn.add_argument("--ops-out", required=True, help="输出：下一步操作 JSON")
     pn.add_argument(
         "--next-trade-date",
         default="",
-        help="语义上的下一交易日 YYYYMMDD；可与 pricing 分列（无当天 CSV 时默认用不大于该日的最近收盘价占位）",
+        help="语义上的下一交易日 YYYYMMDD；可与 pricing 分列（无当天 CSV 时默认用不大于该日的最近成交价占位）",
     )
     pn.add_argument(
         "--strict-next-trade-csv",
@@ -368,18 +403,31 @@ def main() -> None:
     pn.add_argument("--n-pool", type=int, default=30, dest="n_pool")
     pn.add_argument("--k-hold", type=int, default=10, dest="k_hold")
     pn.add_argument("--score-lag", type=int, default=1)
-    pn.add_argument("--commission-bps", type=float, default=None)
+    pn.add_argument(
+        "--trade-price-col",
+        choices=("open", "close"),
+        default="open",
+        help="predict-next 撮合价格列（默认 open，满足每日开盘买卖）",
+    )
+    pn.add_argument("--commission-rate", type=float, default=None)
+    pn.add_argument(
+        "--commission-bps",
+        type=float,
+        default=None,
+        help="兼容旧参数：基点制（万三=3），若提供则覆盖 --commission-rate",
+    )
     pn.add_argument("--launcher", choices=("python", "torchrun"), default="python")
     pn.add_argument("--nproc", type=int, default=1)
     pn.add_argument(
         "train_argv",
         nargs=argparse.REMAINDER,
-        help="传给 train_transformer_baseline.py；须以 -- 隔开。勿把 --skip-train 写在本段（predict-next 另有 --skip-train）",
+        help="传给 train.py；须以 -- 隔开。勿把 --skip-train 写在本段（predict-next 另有 --skip-train）",
     )
 
     args = p.parse_args()
-    if not getattr(args, "data_root", None) or not str(args.data_root).strip():
-        args.data_root = "/home/lhr/my_stuff/fundamentals_for_deep_learning/data"
+    if getattr(args, "commission_bps", None) is not None:
+        args.commission_rate = float(args.commission_bps) / 10000.0
+    args.data_root = resolve_data_root(args.data_root)
 
     tv = getattr(args, "train_argv", None) or []
     if tv and tv[0] == "--":
@@ -390,13 +438,13 @@ def main() -> None:
         if not getattr(args, "skip_train", False):
             args.skip_train = True
             print(
-                "[workflow_cli] 提示：检测到将 --skip-train 粘在其它参数后面或写在「--」之后。"
+                "[workbench] 提示：检测到将 --skip-train 粘在其它参数后面或写在「--」之后。"
                 f"已对 argv 解压并启用跳过训练。推荐写法：`… {_PASS_SKIP_TRAIN} -- …`（{_PASS_SKIP_TRAIN} 在「--」前）。",
                 flush=True,
             )
     elif glued_skip_train and args.cmd == "backtest":
         print(
-            f"[workflow_cli] 提示：{_PASS_SKIP_TRAIN} 仅用于 predict-next，已从你的训练额外参数里移除。"
+            f"[workbench] 提示：{_PASS_SKIP_TRAIN} 仅用于 predict-next，已从你的训练额外参数里移除。"
             "backtest 工作流仍会照常训练后再回测。",
             flush=True,
         )

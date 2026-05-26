@@ -1,20 +1,250 @@
 """
-深度学习大作业 - 数据处理模块
-功能：
-1. 读取daily截面数据，合并为面板数据
-2. 过滤ST股、北交所股票（可配置）；股票池可选 all（默认，以 daily 覆盖为准）/ hs300 / 创业板 / 科创板
-3. 缺失值处理与特征标准化（避免未来信息）
-4. 构造n日收益率标签
-5. 构造滑动窗口样本（过去L天特征 → 未来n日收益）
-6. 按时间划分训练集和验证集（禁止随机打乱）
+data_preprocess：数据根路径、交易日历、侧车并入、日线面板与训练用样本流水线。
 """
+from __future__ import annotations
 
+import bisect
 import os
-import pandas as pd
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
 import numpy as np
-from tqdm import tqdm
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from typing import List, Tuple, Optional, Dict
+from tqdm import tqdm
+PACKAGE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PACKAGE_DIR.parent
+_DEFAULT_RELATIVE_TO_REPO = REPO_ROOT / "data"
+
+
+def resolve_data_root(data_root: Optional[str]) -> str:
+    """
+    规范为绝对路径。优先级：传入参数 > 环境变量 DL_DATA_ROOT >
+    「仓库上一级的 data/」（与克隆路径无关）。
+    """
+    cand = (data_root or "").strip()
+    if not cand:
+        cand = os.environ.get("DL_DATA_ROOT", "").strip()
+    if not cand:
+        cand = str(_DEFAULT_RELATIVE_TO_REPO)
+    return os.path.abspath(os.path.expanduser(cand))
+
+
+# --- 交易日历（基于 trade_cal.csv）---
+
+_OPEN_DAYS_CACHE: Dict[str, List[str]] = {}
+
+
+def normalize_trade_calendar_key(s: str) -> str:
+    """日历比较用 8 位数字串 YYYYMMDD。"""
+    y = str(s).strip().replace("-", "")[:8]
+    if len(y) != 8 or not y.isdigit():
+        raise ValueError(f"日期须为 YYYY-MM-DD 或 YYYYMMDD: {s!r}")
+    return y
+
+
+def load_open_trading_days(data_root: str) -> List[str]:
+    root_key = str(Path(data_root).resolve())
+    cached = _OPEN_DAYS_CACHE.get(root_key)
+    if cached is not None:
+        return cached
+    path = Path(root_key) / "trade_cal.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"缺少交易日历: {path}")
+    cal = pd.read_csv(path)
+    cal["cal_date"] = cal["cal_date"].astype(str)
+    o = cal.loc[cal["is_open"] == 1, "cal_date"].astype(str).unique()
+    out = sorted(o.tolist())
+    _OPEN_DAYS_CACHE[root_key] = out
+    return out
+
+
+def next_trading_day_strictly_after(anchor_yyyymmdd: str, data_root: str) -> str:
+    """
+    若某日收盘后只能使用 T 及以前的数据，则监督验证 / 回测截面的首日锚定应不早于
+    「T 的下一个交易日」。本函数返回日历中严格晚于 anchor 的第一个开市日（字符串 8 位）。"""
+    d = normalize_trade_calendar_key(anchor_yyyymmdd)
+    days = load_open_trading_days(data_root)
+    i = bisect.bisect_right(days, d)
+    if i >= len(days):
+        raise ValueError(
+            f"在 trade_cal 中找不到严格晚于 {d} 的开市日（请检查 data-root 与日历区间）。"
+        )
+    return days[i]
+
+
+def first_open_trading_day_on_or_after(anchor_yyyymmdd: str, data_root: str) -> Optional[str]:
+    """sorted 开市日序列上首个 >= anchor 的开市日；找不到则返回 None。"""
+    d = normalize_trade_calendar_key(anchor_yyyymmdd)
+    days = load_open_trading_days(data_root)
+    i = bisect.bisect_left(days, d)
+    if i >= len(days):
+        return None
+    return days[i]
+
+
+def fmt_yyyy_mm_dd(yyyymmdd: str) -> str:
+    s = normalize_trade_calendar_key(yyyymmdd)
+    return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+
+def _slug_from_market_file(fname: str) -> str:
+    base = os.path.splitext(fname)[0]
+    return re.sub(r"[^0-9a-zA-Z]+", "_", base).strip("_").lower()
+
+
+def merge_moneyflow_metric_market_into_panel(
+    df: pd.DataFrame,
+    data_root: str,
+    *,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    df: MultiIndex (trade_date, ts_code)，与 load_data 输出一致。
+    返回同源索引的扩展面板（numeric 缺失左连接后为 NaN，由上游 ffill/Nan 策略处理）。
+    """
+    if df is None or len(df.index) == 0:
+        return df
+
+    orig_cols = set(df.columns)
+    trade_days: List[str] = sorted(
+        {
+            str(d).replace("-", "").replace("/", "")[:8]
+            for d in df.index.get_level_values(0).unique()
+        }
+    )
+    trade_days = [d for d in trade_days if len(d) == 8 and d.isdigit()]
+    mf_dir = os.path.join(data_root, "moneyflow")
+    mt_dir = os.path.join(data_root, "metric")
+    mkt_dir = os.path.join(data_root, "market")
+
+    # -------- moneyflow --------
+    mf_parts: List[pd.DataFrame] = []
+    for d in tqdm(trade_days, desc=".merge moneyflow", disable=not verbose):
+        fp = os.path.join(mf_dir, f"{d}.csv")
+        if not os.path.isfile(fp):
+            continue
+        m = pd.read_csv(fp)
+        if "ts_code" not in m.columns:
+            continue
+        ren = {}
+        skip = {"ts_code", "trade_date"}
+        for c in m.columns:
+            if c in skip:
+                continue
+            ren[c] = f"mf_{c}"
+        m = m.rename(columns=ren)
+        m["ts_code"] = m["ts_code"].astype(str)
+        m["trade_date"] = d
+        mf_parts.append(m)
+    if mf_parts:
+        mf_all = pd.concat(mf_parts, ignore_index=True)
+        mf_idx = mf_all.set_index(["trade_date", "ts_code"]).sort_index()
+    else:
+        mf_idx = None
+
+    # -------- metric --------
+    mt_parts: List[pd.DataFrame] = []
+    for d in tqdm(trade_days, desc=".merge metric", disable=not verbose):
+        fp = os.path.join(mt_dir, f"{d}.csv")
+        if not os.path.isfile(fp):
+            continue
+        m = pd.read_csv(fp)
+        if "ts_code" not in m.columns:
+            continue
+        ren = {}
+        for c in m.columns:
+            if c in ("ts_code", "trade_date"):
+                continue
+            ren[c] = f"mtr_{c}"
+        m = m.rename(columns=ren)
+        m["ts_code"] = m["ts_code"].astype(str)
+        m["trade_date"] = d
+        mt_parts.append(m)
+    if mt_parts:
+        mt_all = pd.concat(mt_parts, ignore_index=True)
+        mt_idx = mt_all.set_index(["trade_date", "ts_code"]).sort_index()
+    else:
+        mt_idx = None
+
+    out = df
+    dup_drop_msgs: List[str] = []
+    if mf_idx is not None:
+        dup = set(mf_idx.columns) & set(out.columns)
+        if dup:
+            mf_idx = mf_idx.drop(columns=list(dup), errors="ignore")
+            dup_drop_msgs.append(f"moneyflow overlap drop {dup}")
+        out = out.join(mf_idx, how="left")
+        if verbose and dup_drop_msgs:
+            print(f"[panel_sidecars] {'; '.join(dup_drop_msgs)}", flush=True)
+
+    dup_drop_msgs = []
+    if mt_idx is not None:
+        dup = set(mt_idx.columns) & set(out.columns)
+        if dup:
+            mt_idx = mt_idx.drop(columns=list(dup), errors="ignore")
+            dup_drop_msgs.append(f"metric overlap drop {dup}")
+        out = out.join(mt_idx, how="left")
+        if verbose and dup_drop_msgs:
+            print(f"[panel_sidecars] {'; '.join(dup_drop_msgs)}", flush=True)
+
+    # -------- market indices (broadcast) --------
+    idx_frames: List[pd.DataFrame] = []
+    if os.path.isdir(mkt_dir):
+        for fn in sorted(os.listdir(mkt_dir)):
+            if not fn.endswith(".csv"):
+                continue
+            fp = os.path.join(mkt_dir, fn)
+            mk = pd.read_csv(fp)
+            if "trade_date" not in mk.columns:
+                continue
+            slug = _slug_from_market_file(fn)
+            mk = mk.copy()
+            mk["trade_date"] = mk["trade_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+            numeric_cols: List[str] = []
+            for c in mk.columns:
+                if c in ("ts_code", "trade_date"):
+                    continue
+                if pd.api.types.is_numeric_dtype(mk[c]):
+                    numeric_cols.append(c)
+            prio = ["pct_chg", "change", "close", "vol", "amount", "open", "high", "low", "pre_close"]
+            ordered = [c for c in prio if c in numeric_cols] + [c for c in numeric_cols if c not in prio]
+            take = ordered[:24]
+            if not take:
+                continue
+            piece = mk[["trade_date"] + take].copy()
+            ren2 = {c: f"idx_{slug}_{c}" for c in piece.columns if c != "trade_date"}
+            piece = piece.rename(columns=ren2)
+            idx_frames.append(piece.drop_duplicates(subset=["trade_date"]))
+
+    if idx_frames:
+        mkt_wide = idx_frames[0]
+        for p in idx_frames[1:]:
+            mkt_wide = mkt_wide.merge(p, on="trade_date", how="outer")
+        mkt_wide["trade_date"] = mkt_wide["trade_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        mkt_wide = mkt_wide.drop_duplicates("trade_date").set_index("trade_date").sort_index()
+        idx_cols_all = [c for c in mkt_wide.columns if str(c).startswith("idx_")]
+        dates_arr = out.index.get_level_values(0).astype(str).str.replace("-", "", regex=False).str[:8]
+        for c in idx_cols_all:
+            ser = mkt_wide[c].reindex(dates_arr)
+            out[c] = pd.to_numeric(ser, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+    if verbose:
+        new_ix = [c for c in out.columns if c not in orig_cols]
+        n_mf = sum(1 for c in new_ix if str(c).startswith("mf_"))
+        n_mt = sum(1 for c in new_ix if str(c).startswith("mtr_"))
+        n_ix = sum(1 for c in new_ix if str(c).startswith("idx_"))
+        print(
+            f"[panel_sidecars] 新增数值列共 {len(new_ix)}（mf_/mtr_/idx_ → {n_mf}/{n_mt}/{n_ix}）",
+            flush=True,
+        )
+
+    return out
+
+def panel_stock_codes(panel: pd.DataFrame) -> Set[str]:
+    return set(panel.index.get_level_values("ts_code").astype(str).unique())
+
 
 
 def _numeric_feature_columns(df: pd.DataFrame) -> List[str]:
@@ -24,18 +254,18 @@ def _numeric_feature_columns(df: pd.DataFrame) -> List[str]:
 
 
 class DataProcessor:
-    def __init__(self, data_root: str, *, verbose: bool = True):
+    def __init__(self, data_root: Optional[str] = None, *, verbose: bool = True):
         """
         Args:
-            data_root: 数据根目录，应包含 daily/, basic.csv, trade_cal.csv, stock_st/ 等
+            data_root: 数据根目录；空则环境变量 DL_DATA_ROOT，再退回仓库根目录下 ``data/``（见 ``data_paths.resolve_data_root``）。
             verbose: False 时关闭 tqdm 与信息类 print（供 DDP 非主进程消音）
         """
-        self.data_root = data_root
+        self.data_root = resolve_data_root(data_root)
         self.verbose = bool(verbose)
-        self.daily_dir = os.path.join(data_root, 'daily')
-        self.basic_path = os.path.join(data_root, 'basic.csv')
-        self.trade_cal_path = os.path.join(data_root, 'trade_cal.csv')
-        self.st_dir = os.path.join(data_root, 'stock_st')
+        self.daily_dir = os.path.join(self.data_root, "daily")
+        self.basic_path = os.path.join(self.data_root, "basic.csv")
+        self.trade_cal_path = os.path.join(self.data_root, "trade_cal.csv")
+        self.st_dir = os.path.join(self.data_root, "stock_st")
         
         self.df = None          # 合并后的面板数据 (date, ts_code, features)
         self.feature_cols = None
@@ -95,6 +325,21 @@ class DataProcessor:
         Returns:
             DataFrame: MultiIndex (trade_date, ts_code) 包含所有量价特征
         """
+        if not os.path.isdir(self.data_root):
+            raise FileNotFoundError(
+                "数据根目录不存在或不可访问。\n"
+                f"  解析后路径: {self.data_root}\n"
+                "  请检查 `--data-root`、`DL_DATA_ROOT` 是否为空或指向错误。"
+                "\n示例: `--data-root /home/lhr/my_stuff/fundamentals_for_deep_learning/data`"
+            )
+        if not os.path.isfile(self.trade_cal_path):
+            raise FileNotFoundError(
+                "找不到交易日历（应在数据根目录下）。\n"
+                f"  期望文件: {self.trade_cal_path}\n"
+                f"  当前 data_root: {self.data_root}\n"
+                "若你曾经把 `DL_DATA_ROOT=` 设为**空**，会导致 join 后对 `trade_cal.csv` 的解析落在错误的工作目录；"
+                "请取消空导出或使用绝对路径。"
+            )
         # 获取交易日历
         cal = pd.read_csv(self.trade_cal_path)
         # 统一日期列为字符串格式
@@ -380,10 +625,11 @@ class DataProcessor:
         df_clean = df_clean.loc[valid_idx]
         df_clean = pd.concat([df_clean, feature_data], axis=1)
         
-        # 按股票分组生成序列
-        X_list, y_list = [], []
-        date_info = []  # 存储样本对应的日期（用于回测）
-        stock_info = []
+        # 按股票分组生成序列（向量化滑窗，避免 Python 内层逐 i 循环）
+        X_chunks: List[np.ndarray] = []
+        y_chunks: List[np.ndarray] = []
+        date_chunks: List[np.ndarray] = []
+        stock_chunks: List[np.ndarray] = []
         
         grouped = df_clean.groupby('ts_code')
         for stock, grp in tqdm(grouped, desc="Creating sequences", disable=not self.verbose):
@@ -397,28 +643,32 @@ class DataProcessor:
             max_i = len(dates) - window_len - horizon
             if max_i <= 0:
                 continue
-            for i in range(max_i):
-                # 特征：过去 window_len 天的特征
-                X_seq = values[i:i+window_len, :]
-                # 标签：第 i+window_len 天后的 horizon 日收益（对应日期为 dates[i+window_len]）
-                y_label = labels[i+window_len]   # 因为标签已对齐到第 i+window_len 天的未来收益
-                # 特征对应 dates[i]..dates[i+window_len-1]；标签贴在行 dates[i+window_len]
-                # （该行收益从该行收盘至未来 horizon 个交易日）
-                sample_date = dates[i+window_len]
-                
-                X_list.append(X_seq)
-                y_list.append(y_label)
-                date_info.append(sample_date)
-                stock_info.append(stock)
-        
-        if len(X_list) == 0:
+            # windows.shape = (len(dates)-window_len+1, window_len, feat_dim)
+            windows = np.lib.stride_tricks.sliding_window_view(
+                values, window_shape=window_len, axis=0
+            )
+            # sliding_window_view(axis=0) 返回 (n, feat_dim, window_len)，转为 (n, window_len, feat_dim)
+            windows = np.swapaxes(windows, 1, 2)
+            n_use = max_i
+            X_stock = windows[:n_use].astype(np.float32, copy=False)
+            idx = np.arange(window_len, window_len + n_use, dtype=np.int64)
+            y_stock = labels[idx].astype(np.float32, copy=False)
+            d_stock = np.asarray(dates[idx], dtype=object)
+            s_stock = np.full(shape=(n_use,), fill_value=str(stock), dtype=object)
+
+            X_chunks.append(X_stock)
+            y_chunks.append(y_stock)
+            date_chunks.append(d_stock)
+            stock_chunks.append(s_stock)
+
+        if len(X_chunks) == 0:
             raise ValueError("No sequences generated. Check window_len/horizon and data length.")
         
         # 转换为数组
-        X = np.array(X_list, dtype=np.float32)
-        y = np.array(y_list, dtype=np.float32).reshape(-1, 1)
-        dates_arr = np.array(date_info)
-        stocks_arr = np.array(stock_info)
+        X = np.concatenate(X_chunks, axis=0).astype(np.float32, copy=False)
+        y = np.concatenate(y_chunks, axis=0).astype(np.float32, copy=False).reshape(-1, 1)
+        dates_arr = np.concatenate(date_chunks, axis=0)
+        stocks_arr = np.concatenate(stock_chunks, axis=0)
         
         # 按时间划分（禁止打乱）
         # 将传入的日期范围字符串转换为 YYYYMMDD 格式
@@ -460,7 +710,7 @@ class DataProcessor:
                     "\n若你想以某日 D 作为验证/导出 `pred_score` 的 trade_date，请确保 "
                     "`--load-end` / `daily/` 已覆盖至 **D 之后至少 horizon 个交易日** "
                     "（例如 horizon=1 时需存在 **D 的下一交易日** 的日线 CSV）。"
-                    "\n若是「末日推理」训练流程，请使用 train_transformer_baseline.py 的 `--workflow predict-next`。"
+                    "\n若是「末日推理」训练流程，请使用 train.py 的 `--workflow predict-next`。"
                 )
             X_val = np.empty((0, X.shape[1], X.shape[2]), dtype=np.float32)
             y_val = np.empty((0, 1), dtype=np.float32)
@@ -573,20 +823,28 @@ class DataProcessor:
                      end_date='2025-12-31',
                      stock_pool='all',
                      window_len=20,
-                     horizon=1,
+                     horizon=30,
                      train_range=('2022-01-01', '2024-12-31'),
                      val_range=('2025-01-01', '2025-12-31'),
                      add_ta: bool = True,
                      use_all_daily_columns: bool = False,
-                     allow_empty_val: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                     allow_empty_val: bool = False,
+                     use_data_moneyflow_metric_index: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         执行完整数据处理流程
         Returns:
             X_train_scaled, y_train, X_val_scaled, y_val
+
+        ``use_data_moneyflow_metric_index``：读入 ``moneyflow/metric/market`` 并入面板（本文件内 ``merge_moneyflow_metric_market_into_panel``）。
+        训练数据范围与 ``../data/README.md`` 一致：日线、交易日历、basic、ST 过滤、側车三表与指数；不包含新闻或外部长表。
         """
-        # 1. 加载并过滤
         self.load_data(start_date, end_date, stock_pool, exclude_st=True, exclude_bj=True)
-        # 2. 特征选择与构造
+
+        if use_data_moneyflow_metric_index:
+            self.df = merge_moneyflow_metric_market_into_panel(
+                self.df, self.data_root, verbose=self.verbose
+            )
+
         self.select_features(add_ta=add_ta, use_all_daily_columns=use_all_daily_columns)
         # 3. 构造标签
         self.construct_labels(horizon=horizon, label_type='return')
@@ -613,13 +871,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="全市场（默认）或子池 + 日线数据处理示例")
     parser.add_argument(
         "--data-root",
-        default=os.environ.get(
-            "DL_DATA_ROOT",
-            "/home/lhr/my_stuff/fundamentals_for_deep_learning/data",
-        ),
+        default=os.environ.get("DL_DATA_ROOT", ""),
         help="数据根目录（含 daily/, index_weight/, basic.csv 等）",
     )
     args = parser.parse_args()
+    args.data_root = resolve_data_root(args.data_root)
 
     processor = DataProcessor(args.data_root)
     X_train, y_train, X_val, y_val = processor.run_pipeline(
@@ -627,7 +883,7 @@ if __name__ == "__main__":
         end_date="2025-12-31",
         stock_pool="all",
         window_len=20,
-        horizon=1,
+        horizon=30,
         train_range=("2022-01-01", "2024-12-31"),
         val_range=("2025-01-01", "2025-12-31"),
         add_ta=False,
