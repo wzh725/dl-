@@ -629,6 +629,7 @@ class DataProcessor:
         X_chunks: List[np.ndarray] = []
         y_chunks: List[np.ndarray] = []
         date_chunks: List[np.ndarray] = []
+        label_end_chunks: List[np.ndarray] = []
         stock_chunks: List[np.ndarray] = []
         
         grouped = df_clean.groupby('ts_code')
@@ -654,11 +655,13 @@ class DataProcessor:
             idx = np.arange(window_len, window_len + n_use, dtype=np.int64)
             y_stock = labels[idx].astype(np.float32, copy=False)
             d_stock = np.asarray(dates[idx], dtype=object)
+            d_end_stock = np.asarray(dates[idx + horizon], dtype=object)
             s_stock = np.full(shape=(n_use,), fill_value=str(stock), dtype=object)
 
             X_chunks.append(X_stock)
             y_chunks.append(y_stock)
             date_chunks.append(d_stock)
+            label_end_chunks.append(d_end_stock)
             stock_chunks.append(s_stock)
 
         if len(X_chunks) == 0:
@@ -668,6 +671,7 @@ class DataProcessor:
         X = np.concatenate(X_chunks, axis=0).astype(np.float32, copy=False)
         y = np.concatenate(y_chunks, axis=0).astype(np.float32, copy=False).reshape(-1, 1)
         dates_arr = np.concatenate(date_chunks, axis=0)
+        label_end_arr = np.concatenate(label_end_chunks, axis=0)
         stocks_arr = np.concatenate(stock_chunks, axis=0)
         
         # 按时间划分（禁止打乱）
@@ -692,8 +696,18 @@ class DataProcessor:
         val_end     = to_yyyymmdd(val_date_range[1])
 
         dates_norm = np.array([norm_anchor(d) for d in dates_arr])
-        train_mask = (dates_norm >= train_start) & (dates_norm <= train_end)
+        label_end_norm = np.array([norm_anchor(d) for d in label_end_arr])
+
+        train_mask_raw = (dates_norm >= train_start) & (dates_norm <= train_end)
+        # 防止 horizon 标签跨入验证期（purge）：训练样本标签结束日必须严格早于 val_start。
+        train_mask = train_mask_raw & (label_end_norm < val_start)
         val_mask   = (dates_norm >= val_start) & (dates_norm <= val_end)
+
+        dropped_by_purge = int(train_mask_raw.sum() - train_mask.sum())
+        if dropped_by_purge > 0:
+            self._vprint(
+                f"[purge] drop train samples crossing val_start={val_start}: {dropped_by_purge}"
+            )
         
         X_train, y_train = X[train_mask], y[train_mask]
 
@@ -726,6 +740,8 @@ class DataProcessor:
         # 保存样本对应的日期和股票，便于回测
         self.train_dates = dates_norm[train_mask]
         self.train_stocks = stocks_arr[train_mask]
+        self.train_label_end_dates = label_end_norm[train_mask]
+        self.val_label_end_dates = label_end_norm[val_mask] if val_mask.sum() > 0 else np.array([], dtype=str)
 
         return X_train, y_train, X_val, y_val
     
@@ -781,6 +797,60 @@ class DataProcessor:
         if not X_list:
             raise ValueError(
                 f"推理锚定日 {anchor_s} 无可用样本：请确认该日在面板内、且每只股票历史长度 ≥ window_len={window_len}。"
+            )
+        return np.stack(X_list, axis=0), np.asarray(codes, dtype=str)
+
+    def build_inference_X_for_next_trade(self, asof_date: str, window_len: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        构造用于「下一交易日」决策的输入矩阵：
+        - asof_date 为最新可用行情日（通常是盘后）
+        - 输入窗口**包含** asof_date 当天，即 [asof-window_len+1, asof]
+        """
+        if self.label_col not in self.df.columns:
+            raise ValueError("Labels not constructed. Call construct_labels() first.")
+        asof_s = str(asof_date).replace("-", "")[:8]
+        if len(asof_s) != 8 or not asof_s.isdigit():
+            raise ValueError(f"无效 asof_date: {asof_date!r}，应为 YYYYMMDD 或 YYYY-MM-DD")
+
+        feature_data = self.df[self.feature_cols].copy()
+        feature_data = feature_data.groupby("ts_code").transform(lambda x: x.ffill())
+        valid_idx = feature_data.notna().all(axis=1)
+        df_sub = self.df.loc[valid_idx]
+        feature_data = feature_data.loc[valid_idx]
+        df_clean = df_sub[[self.label_col]].copy()
+        df_clean = pd.concat([df_clean, feature_data], axis=1)
+
+        def norm_day(d) -> str:
+            s = str(d).replace("-", "")[:8]
+            if len(s) != 8 or not s.isdigit():
+                raise ValueError(f"无法解析交易日: {d!r}")
+            return s
+
+        X_list: List[np.ndarray] = []
+        codes: List[str] = []
+        grouped = df_clean.groupby("ts_code")
+        for stock, grp in grouped:
+            grp = grp.sort_index(level="trade_date")
+            dates = grp.index.get_level_values("trade_date").unique()
+            values = grp[self.feature_cols].values
+            j = None
+            for idx in range(len(dates)):
+                if norm_day(dates[idx]) == asof_s:
+                    j = idx
+                    break
+            if j is None:
+                continue
+            if j < (window_len - 1):
+                continue
+            X_seq = values[j - window_len + 1 : j + 1].astype(np.float32)
+            if not np.isfinite(X_seq).all():
+                continue
+            X_list.append(X_seq)
+            codes.append(str(stock))
+
+        if not X_list:
+            raise ValueError(
+                f"推理 asof_date={asof_s} 无可用样本：请确认该日在面板内、且每只股票历史长度 ≥ window_len={window_len}。"
             )
         return np.stack(X_list, axis=0), np.asarray(codes, dtype=str)
 

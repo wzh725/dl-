@@ -636,10 +636,23 @@ def run_backtest(
             rows.append(_curve_row(d, nav, cash, _n_positions()))
             continue
 
-        if score_lag <= 0 or di == 0:
+        if score_lag > 0 and di < score_lag:
+            nav = cash + _mv_shares(trade_px_on, d, sellable, locked)
+            rows.append(
+                _curve_row(
+                    d,
+                    nav,
+                    cash,
+                    _n_positions(),
+                    score_date_=np.nan,
+                )
+            )
+            continue
+
+        if score_lag <= 0:
             score_date = d
         else:
-            idx = max(0, di - score_lag)
+            idx = di - score_lag
             score_date = dates[idx]
 
         day_scores = scores[(scores["trade_date"] == score_date) & (scores["ts_code"].isin(codes_today))].copy()
@@ -688,7 +701,7 @@ def run_backtest(
 
         nav_before = cash + _mv_shares(trade_px_on, d, sellable, locked)
         if nav_before <= 1e-9:
-            rows.append(_curve_row(d, nav_before, cash, 0, score_date_=score_date))
+            rows.append(_curve_row(d, nav_before, cash, _n_positions(), score_date_=score_date))
             continue
 
         held_after_sell = {
@@ -711,7 +724,7 @@ def run_backtest(
                 d,
                 nav_after,
                 cash,
-                len({c for c, sh in locked.items() if sh > 0}),
+                _n_positions(),
                 score_date_=score_date,
                 turnover_sell_=turnover_sell if turnover_sell > 1e-9 else np.nan,
                 turnover_buy_=spent,
@@ -723,6 +736,7 @@ def run_backtest(
     curve["daily_ret"] = curve["nav"].pct_change()
 
     total_ret = float(curve["nav"].iloc[-1] / initial_cash - 1.0)
+    annual_return = float((curve["nav"].iloc[-1] / initial_cash) ** (252.0 / max(len(curve), 1)) - 1.0)
     mdd = max_drawdown(curve["nav"].values.astype(float))
     sharpe = sharpe_ratio(curve["daily_ret"].values.astype(float))
     comm_sum = float(curve["commission"].fillna(0.0).sum()) if "commission" in curve.columns else 0.0
@@ -732,6 +746,7 @@ def run_backtest(
         "initial_cash": float(initial_cash),
         "final_nav": float(curve["nav"].iloc[-1]),
         "total_return": total_ret,
+        "annual_return": annual_return,
         "max_drawdown": mdd,
         "sharpe_ann_approx": sharpe,
         "calmar_ratio_approx": calmar,

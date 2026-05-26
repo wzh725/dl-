@@ -643,7 +643,7 @@ def main() -> None:
         help=(
             "无需 T+1 行情：在面板最后交易日即可导出锚定日 pred_score（YYYY-MM-DD）。"
             "可用关键字 auto（默认用于 workflow=predict-next）：自动取面板最后交易日。"
-            "须同时指定 --export-scores；特征窗口与训练一致。"
+            "须同时指定 --export-scores；workflow=predict-next 时推理窗口会包含该锚定日当日特征。"
             "典型用法：日线只到 20260519 时，取 --val-* 为倒数第二个交易日作验证，"
             "本参数填面板末日用于次日决策。"
         ),
@@ -1311,7 +1311,10 @@ def main() -> None:
                 )
             pinf.select_features(add_ta=False, use_all_daily_columns=True)
             pinf.construct_labels(horizon=args.horizon)
-            X_inf, st_inf = pinf.build_inference_X_at_anchor(anchor_s, args.window_len)
+            if args.workflow == "predict-next":
+                X_inf, st_inf = pinf.build_inference_X_for_next_trade(anchor_s, args.window_len)
+            else:
+                X_inf, st_inf = pinf.build_inference_X_at_anchor(anchor_s, args.window_len)
             if tuple(pinf.feature_cols) != tuple(full_feature_cols):
                 raise RuntimeError(
                     "推理分支特征列与训练不一致；请检查两次 load/select 参数是否相同。"
@@ -1343,7 +1346,7 @@ def main() -> None:
                     "label_return": np.nan,
                 }
             )
-            note = "（推理导出：无 T+1 标签，label_return 为空）"
+            note = "（推理导出：无 T+1 标签，label_return 为空；predict-next 含锚定日当日输入）"
         else:
             val_preds: list[np.ndarray] = []
             with torch.no_grad():
