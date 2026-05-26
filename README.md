@@ -58,6 +58,8 @@ python workbench.py backtest \
   --keep-all-base-features \
   --sidecar-feature-budget 10 \
   --feature-report-path outputs/feature_report.json \
+  --export-metrics-json outputs/wf_metrics.json \
+  --export-daily-ic-csv outputs/wf_daily_ic.csv \
   --early-stop-min-epochs 25 \
   --early-stop-patience 12
 ```
@@ -85,7 +87,8 @@ python workbench.py predict-next \
   --epochs 70 \
   --batch-size 1024 \
   --horizon 7 \
-  --stock-pool all
+  --stock-pool all \
+  --export-metrics-json outputs/wf_metrics.json
 ```
 
 如已存在 `outputs/wf_scores.csv`，可加 `--skip-train` 跳过训练，仅生成建议。
@@ -100,6 +103,8 @@ python workbench.py predict-next \
 | `outputs/wf_equity.csv` | 回测逐日净值曲线（含成交额、持仓数、费用等）。 |
 | `outputs/wf_summary.csv` | 回测摘要（含 `total_return`、`annual_return`、`max_drawdown`、`sharpe_ann_approx` 等）。 |
 | `outputs/feature_report.json` | 特征筛选报告（保留列、剔除列、IC 打分）。 |
+| `outputs/wf_metrics.json` | 训练阶段验证指标汇总（IC、RankIC、ICIR、方向胜率等）。 |
+| `outputs/wf_daily_ic.csv` | 逐交易日 Pearson IC 序列（便于画时间序列图）。 |
 | `outputs/final_ops.json` | 次日操作建议与收盘后状态。 |
 
 ---
