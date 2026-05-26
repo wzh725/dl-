@@ -27,6 +27,62 @@ export DL_DATA_ROOT=/path/to/fundamentals_for_deep_learning/data
 
 ---
 
+## 2.5) 最新推荐命令（先看这里）
+
+### A. 训练 + 回测（最新推荐）
+
+```bash
+python workbench.py backtest \
+  --data-root "$DL_DATA_ROOT" \
+  --train-start 2016-01-01 \
+  --train-end 2026-01-06 \
+  --val-start 2026-01-07 \
+  --backtest-end 2026-04-07 \
+  --scores-out outputs/wf_scores.csv \
+  --out-curve outputs/wf_equity.csv \
+  --out-summary outputs/wf_summary.csv \
+  --n-pool 30 \
+  --k-hold 8 \
+  --score-lag 1 \
+  --trade-price-col open \
+  --commission-rate 0.0003 \
+  --launcher torchrun \
+  --nproc 8 \
+  -- \
+  --epochs 70 \
+  --batch-size 1024 \
+  --horizon 3 \
+  --stock-pool all
+```
+
+### B. 仅生成次日指令（已有分数，不重训）
+
+```bash
+python workbench.py predict-next \
+  --data-root "$DL_DATA_ROOT" \
+  --train-start 2016-01-01 \
+  --train-end 2026-01-06 \
+  --export-scores outputs/wf_scores.csv \
+  --state-in examples/state_holding.json \
+  --ops-out outputs/final_ops.json \
+  --next-trade-date 20260408 \
+  --n-pool 30 \
+  --k-hold 8 \
+  --score-lag 1 \
+  --trade-price-col open \
+  --commission-rate 0.0003 \
+  --skip-train
+```
+
+### C. `predict` 费率默认值说明（避免混淆）
+
+- `predict.py --commission-rate` 默认是 `None`（不覆盖）
+- `predict.py --commission-bps` 默认是 `None`（兼容旧参数）
+- 当两者都不传时，使用 `state` JSON 里的 `commission_rate`
+- 仅当你传了 `--commission-bps` 时，才按 `bps/10000` 覆盖 `--commission-rate`
+
+---
+
 ## 3) 一条命令跑回测
 
 ```bash
@@ -43,7 +99,7 @@ python workbench.py backtest \
   --k-hold 8 \
   --score-lag 1 \
   --trade-price-col open \
-  --commission-rate 0.0002 \
+  --commission-rate 0.0003 \
   --launcher torchrun \
   --nproc 8 \
   -- \
@@ -81,8 +137,9 @@ python workbench.py predict-next \
   --k-hold 8 \
   --score-lag 1 \
   --trade-price-col open \
-  --commission-rate 0.0002 \
-  --launcher python \
+  --commission-rate 0.0003 \
+  --launcher torchrun \
+  --nproc 8 \
   -- \
   --epochs 70 \
   --batch-size 1024 \
@@ -91,7 +148,7 @@ python workbench.py predict-next \
   --export-metrics-json outputs/wf_metrics.json
 ```
 
-如已存在 `outputs/wf_scores.csv`，可加 `--skip-train` 跳过训练，仅生成建议。
+如已存在 `outputs/wf_scores.csv`，可加 `--skip-train` 跳过训练，仅生成建议（此时可不写 `--launcher/--nproc` 与 `--` 后训练参数）。
 
 当 `--next-trade-date` 当天的 `daily/{date}.csv` 尚未落盘，且 `--trade-price-col open` 时，
 脚本会显式采用“前一可用交易日 `close` 近似次日 `open`”的规则（终端会打印占位提示）。
@@ -130,7 +187,7 @@ python workbench.py predict-next \
 - `--n-pool --k-hold`：候选池大小与持仓只数
 - `--score-lag`：打分滞后天数（推荐 1）
 - `--trade-price-col`：撮合价格列（`open`/`close`）
-- `--commission-rate`：券商佣金费率（小数，如 `0.0002`）
+- `--commission-rate`：券商佣金费率（小数，如 `0.0003`）
 - `--skip-train`：仅 `predict-next` 可用，跳过训练
 
 `train.py`（`--` 后）：
