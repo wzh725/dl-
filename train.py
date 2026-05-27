@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
+import pickle
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -146,10 +147,9 @@ def load_real_data(args):
     print(f"验证集样本数: {len(X_val)}")
     print(f"特征维度: {X_train.shape[-1]}")
 
-    # 更新实际的特征维度
     args.input_dim = X_train.shape[-1]
 
-    return X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val
+    return X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val, processor
 
 
 def create_dataloaders(args, X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val):
@@ -257,7 +257,7 @@ def main():
     print(f"训练参数: {args}")
     print(f"使用设备: {args.device}")
 
-    X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val = load_real_data(args)
+    X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val, processor = load_real_data(args)
 
     train_loader, val_loader = create_dataloaders(
         args, X_train, y_op_train, y_lp_train, y_hp_train,
@@ -349,7 +349,26 @@ def main():
                 ema.restore(model)
             else:
                 torch.save(save_state, model_path)
+            scaler_path = os.path.join(args.save_dir, 'scaler.pkl')
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(processor.scaler, f)
+            meta_path = os.path.join(args.save_dir, 'model_meta.pkl')
+            with open(meta_path, 'wb') as f:
+                pickle.dump({
+                    'input_dim': args.input_dim,
+                    'hidden_dim': args.hidden_dim,
+                    'num_layers': args.num_layers,
+                    'dropout': args.dropout,
+                    'fc_dropout': args.fc_dropout,
+                    'bidirectional': args.bidirectional,
+                    'label_scale': args.label_scale,
+                    'seq_len': args.seq_len,
+                    'use_fundamental': args.use_fundamental,
+                    'use_moneyflow': args.use_moneyflow,
+                }, f)
             print(f"保存最佳模型: {model_path}")
+            print(f"保存Scaler: {scaler_path}")
+            print(f"保存元数据: {meta_path}")
         else:
             early_stopping_count += 1
             print(f"早停计数: {early_stopping_count}/{early_stopping_patience}")
