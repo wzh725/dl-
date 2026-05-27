@@ -10,70 +10,103 @@ from data_processor import DataProcessor
 from model import AssociatedResidualNet, JointDirectionalLoss, ListNetLoss
 
 
+class EMAModel:
+    """
+    指数移动平均模型权重，提升泛化能力和训练稳定性
+    shadow = decay * shadow + (1 - decay) * model
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.update(model)
+
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if name not in self.shadow:
+                    self.shadow[name] = param.data.clone()
+                else:
+                    self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+
+    def apply_shadow(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name].clone()
+
+    def restore(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name].clone()
+        self.backup = {}
+
+
 class CompositeLoss(nn.Module):
     """
     复合损失函数：回归损失 + 排序损失
 
     Total_Loss = Loss_regression + lambda * Loss_ranking
 
-    其中：
-    - Loss_regression: JointDirectionalLoss（三个分支的方向回归损失）
-    - Loss_ranking: ListNetLoss（截面排序损失）
-    - lambda: 排序损失权重（默认1.0）
+    注意：排序损失在 mini-batch 随机打乱时无法代表真实的截面排序，
+    因此默认 lambda 较小，仅作为辅助正则项。
     """
 
-    def __init__(self, regression_loss, ranking_loss, ranking_lambda=1.0):
+    def __init__(self, regression_loss, ranking_loss, ranking_lambda=0.1):
         super(CompositeLoss, self).__init__()
         self.regression_loss = regression_loss
         self.ranking_loss = ranking_loss
         self.ranking_lambda = ranking_lambda
 
     def forward(self, pred_op, pred_lp, pred_hp, true_op, true_lp, true_hp):
-        """
-        计算复合损失
-        """
-        # 回归损失
         loss_regression = self.regression_loss(pred_op, pred_lp, pred_hp, true_op, true_lp, true_hp)
-
-        # 排序损失
         loss_ranking = self.ranking_loss(pred_op, pred_hp, true_op, true_hp)
-
-        # 总损失
         total_loss = loss_regression + self.ranking_lambda * loss_ranking
-
         return total_loss
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='训练多值关联残差神经网络（AssociatedResidualNet）')
 
-    # 数据参数
     parser.add_argument('--data_path', type=str, default='D:/zhw/A股数据', help='数据目录路径')
     parser.add_argument('--batch_size', type=int, default=128, help='批次大小')
     parser.add_argument('--seq_len', type=int, default=30, help='时间序列长度/窗口大小')
     parser.add_argument('--horizon', type=int, default=1, help='预测步长')
 
-    # 模型参数
     parser.add_argument('--input_dim', type=int, default=34, help='原始输入特征维度')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM隐藏层维度')
-    parser.add_argument('--num_layers', type=int, default=3, help='LSTM层数')
-    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout概率')
+    parser.add_argument('--hidden_dim', type=int, default=32, help='LSTM隐藏层维度')
+    parser.add_argument('--num_layers', type=int, default=2, help='LSTM层数')
+    parser.add_argument('--dropout', type=float, default=0.4, help='LSTM内部Dropout概率')
+    parser.add_argument('--fc_dropout', type=float, default=0.5, help='输出层前Dropout概率')
     parser.add_argument('--bidirectional', action='store_true', help='是否使用双向LSTM')
 
-    # 训练参数
-    parser.add_argument('--lr', type=float, default=5e-4, help='学习率')
-    parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
+    parser.add_argument('--lr', type=float, default=2e-4, help='学习率')
+    parser.add_argument('--epochs', type=int, default=60, help='训练轮数')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='训练设备')
     parser.add_argument('--adamw', action='store_true', help='是否使用AdamW优化器')
     parser.add_argument('--penalty_weight', type=float, default=1.5, help='方向性惩罚权重')
-    parser.add_argument('--ranking_lambda', type=float, default=1.0, help='ListNet排序损失权重')
-    parser.add_argument('--early_stopping_patience', type=int, default=15, help='早停耐心值')
+    parser.add_argument('--ranking_lambda', type=float, default=0.1, help='ListNet排序损失权重')
+    parser.add_argument('--early_stopping_patience', type=int, default=12, help='早停耐心值')
     parser.add_argument('--label_scale', type=float, default=100.0, help='标签缩放因子')
+    parser.add_argument('--weight_decay', type=float, default=1e-3, help='权重衰减系数')
+    parser.add_argument('--use_fundamental', action='store_true', default=False,
+                        help='是否使用基本面数据（PE-TTM、PB、ROE等）')
+    parser.add_argument('--use_moneyflow', action='store_true', default=False,
+                        help='是否使用资金流数据（大单、超大单等）')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA衰减率（0表示禁用EMA）')
+    parser.add_argument('--noise_std', type=float, default=0.005,
+                        help='训练数据高斯噪声标准差（0表示不添加噪声）')
+    parser.add_argument('--grad_clip', type=float, default=0.5,
+                        help='梯度裁剪最大范数')
+    parser.add_argument('--scheduler_patience', type=int, default=4,
+                        help='ReduceLROnPlateau 耐心值')
+    parser.add_argument('--scheduler_factor', type=float, default=0.5,
+                        help='ReduceLROnPlateau 学习率衰减因子')
 
-    # 保存参数
     parser.add_argument('--save_dir', type=str, default='./saved_models', help='模型保存目录')
 
-    # 数据范围参数
     parser.add_argument('--start_date', type=str, default='2024-06-01', help='数据起始日期')
     parser.add_argument('--end_date', type=str, default='2025-06-30', help='数据结束日期')
     parser.add_argument('--train_start', type=str, default='2024-06-01', help='训练集起始日期')
@@ -81,7 +114,6 @@ def parse_args():
     parser.add_argument('--val_start', type=str, default='2025-04-01', help='验证集起始日期')
     parser.add_argument('--val_end', type=str, default='2025-06-30', help='验证集结束日期')
 
-    # 股票池
     parser.add_argument('--stock_pool', type=str, default='hs300', help='股票池: hs300/all')
 
     return parser.parse_args()
@@ -105,7 +137,9 @@ def load_real_data(args):
         window_len=args.seq_len,
         horizon=args.horizon,
         train_range=(args.train_start, args.train_end),
-        val_range=(args.val_start, args.val_end)
+        val_range=(args.val_start, args.val_end),
+        use_fundamental=args.use_fundamental,
+        use_moneyflow=args.use_moneyflow
     )
 
     print(f"训练集样本数: {len(X_train)}")
@@ -131,10 +165,8 @@ def create_dataloaders(args, X_train, y_op_train, y_lp_train, y_hp_train, X_val,
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        num_workers=0,
+        pin_memory=True
     )
 
     # 验证集
@@ -148,17 +180,14 @@ def create_dataloaders(args, X_train, y_op_train, y_lp_train, y_hp_train, X_val,
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        num_workers=0,
+        pin_memory=True
     )
 
     return train_loader, val_loader
 
 
-def train_one_epoch(model, train_loader, optimizer, criterion, device):
-    """训练一个epoch"""
+def train_one_epoch(model, train_loader, optimizer, criterion, device, noise_std=0.0):
     model.train()
     total_loss = 0.0
 
@@ -167,31 +196,28 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device):
     for batch_idx, batch in pbar:
         x, y_op, y_lp, y_hp = batch
 
-        # 将数据移到设备上
         x = x.to(device)
         y_op = y_op.to(device)
         y_lp = y_lp.to(device)
         y_hp = y_hp.to(device)
 
-        # 前向传播
+        if noise_std > 0:
+            noise = torch.randn_like(x) * noise_std
+            x = x + noise
+
         pred_op, pred_lp, pred_hp = model(x)
 
-        # 计算复合损失
         loss = criterion(pred_op, pred_lp, pred_hp, y_op, y_lp, y_hp)
 
-        # 反向传播和优化
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # 累加损失
         total_loss += loss.item() * x.size(0)
 
-        # 更新进度条描述
         pbar.set_description(f"Training [{batch_idx+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-    # 计算平均损失
     n_samples = len(train_loader.dataset)
     avg_loss = total_loss / n_samples
 
@@ -199,7 +225,6 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device):
 
 
 def validate(model, val_loader, criterion, device):
-    """验证模型"""
     model.eval()
     total_loss = 0.0
 
@@ -208,25 +233,19 @@ def validate(model, val_loader, criterion, device):
     for batch_idx, batch in pbar:
         x, y_op, y_lp, y_hp = batch
 
-        # 将数据移到设备上
         x = x.to(device)
         y_op = y_op.to(device)
         y_lp = y_lp.to(device)
         y_hp = y_hp.to(device)
 
-        # 前向传播
         pred_op, pred_lp, pred_hp = model(x)
 
-        # 计算损失
         loss = criterion(pred_op, pred_lp, pred_hp, y_op, y_lp, y_hp)
 
-        # 累加损失
         total_loss += loss.item() * x.size(0)
 
-        # 更新进度条描述
         pbar.set_description(f"Validating [{batch_idx+1}/{len(val_loader)}] Loss: {loss.item():.4f}")
 
-    # 计算平均损失
     n_samples = len(val_loader.dataset)
     avg_loss = total_loss / n_samples
 
@@ -234,84 +253,102 @@ def validate(model, val_loader, criterion, device):
 
 
 def main():
-    """主训练函数"""
-    # 解析参数
     args = parse_args()
     print(f"训练参数: {args}")
     print(f"使用设备: {args.device}")
 
-    # 加载真实数据
     X_train, y_op_train, y_lp_train, y_hp_train, X_val, y_op_val, y_lp_val, y_hp_val = load_real_data(args)
 
-    # 创建DataLoader
     train_loader, val_loader = create_dataloaders(
         args, X_train, y_op_train, y_lp_train, y_hp_train,
         X_val, y_op_val, y_lp_val, y_hp_val
     )
 
-    # 创建模型
     model = AssociatedResidualNet(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        fc_dropout=args.fc_dropout,
         bidirectional=args.bidirectional
     ).to(args.device)
 
-    # 打印模型结构
     print(f"\n模型结构:\n{model}")
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"可训练参数: {total_params:,}")
 
-    # 配置损失函数：回归损失 + 排序损失
     regression_loss = JointDirectionalLoss(penalty_weight=args.penalty_weight, label_scale=args.label_scale)
     ranking_loss = ListNetLoss(label_scale=args.label_scale)
     criterion = CompositeLoss(regression_loss, ranking_loss, ranking_lambda=args.ranking_lambda)
     print(f"使用复合损失函数：回归损失 + {args.ranking_lambda} * 排序损失")
     print(f"标签缩放因子: {args.label_scale}")
 
-    # 配置优化器
     if args.adamw:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        print("使用 AdamW 优化器")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        print(f"使用 AdamW 优化器 (weight_decay={args.weight_decay})")
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        print("使用 Adam 优化器")
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        print(f"使用 Adam 优化器 (weight_decay={args.weight_decay})")
 
-    # 配置学习率调度器（余弦退火）
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    print("使用余弦退火学习率调度器")
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=args.scheduler_factor,
+        patience=args.scheduler_patience, verbose=True
+    )
+    print(f"使用 ReduceLROnPlateau 调度器 (factor={args.scheduler_factor}, patience={args.scheduler_patience})")
 
-    # 创建保存目录
+    ema = None
+    if args.ema_decay > 0:
+        ema = EMAModel(model, decay=args.ema_decay)
+        print(f"使用 EMA 权重平滑 (decay={args.ema_decay})")
+    else:
+        print("未使用 EMA")
+
+    if args.noise_std > 0:
+        print(f"训练数据添加高斯噪声 (std={args.noise_std})")
+
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 训练循环
     best_val_loss = float('inf')
     early_stopping_count = 0
     early_stopping_patience = args.early_stopping_patience
     print(f"\n开始训练，早停耐心值: {early_stopping_patience}")
-    print("="*60)
+    print("=" * 60)
 
     for epoch in range(args.epochs):
         print(f"\nEpoch [{epoch+1}/{args.epochs}]")
 
-        # 训练
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, args.device)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, criterion, args.device,
+            noise_std=args.noise_std
+        )
 
-        # 验证
+        if ema is not None:
+            ema.update(model)
+            ema.apply_shadow(model)
+
         val_loss = validate(model, val_loader, criterion, args.device)
 
-        # 更新学习率
-        scheduler.step()
+        if ema is not None:
+            ema.restore(model)
 
-        # 打印日志
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
         print(f"训练损失: {train_loss:.6f}")
         print(f"验证损失: {val_loss:.6f}")
+        print(f"当前学习率: {current_lr:.2e}")
 
-        # 保存最佳模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             early_stopping_count = 0
             model_path = os.path.join(args.save_dir, 'best_model.pth')
-            torch.save(model.state_dict(), model_path)
+            save_state = model.state_dict()
+            if ema is not None:
+                ema.apply_shadow(model)
+                torch.save(model.state_dict(), model_path)
+                ema.restore(model)
+            else:
+                torch.save(save_state, model_path)
             print(f"保存最佳模型: {model_path}")
         else:
             early_stopping_count += 1
@@ -321,10 +358,10 @@ def main():
                 print("触发早停，停止训练")
                 break
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(f"训练完成!")
     print(f"最佳验证损失: {best_val_loss:.6f}")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

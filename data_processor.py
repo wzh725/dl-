@@ -33,7 +33,13 @@ class DataProcessor:
             'stock_st'
         )
 
+        # 新增数据路径（文件夹形式）
+        self.fundamental_dir = os.path.join(data_root, 'metric')
+        self.moneyflow_dir = os.path.join(data_root, 'moneyflow')
+
         self.df = None
+        self.df_fundamental = None
+        self.df_moneyflow = None
 
         self.feature_cols = None
 
@@ -100,6 +106,66 @@ class DataProcessor:
         )
 
         return components
+
+    # =========================================================
+    # 加载资金流向数据
+    # =========================================================
+    def load_moneyflow_data(self):
+        """加载资金流向数据（文件夹形式）"""
+        if not os.path.exists(self.moneyflow_dir):
+            print(f"警告：未找到资金流向数据目录 {self.moneyflow_dir}")
+            self.df_moneyflow = None
+            return
+
+        all_files = [f for f in os.listdir(self.moneyflow_dir) if f.endswith('.csv')]
+        if not all_files:
+            print("警告：资金流向目录为空")
+            self.df_moneyflow = None
+            return
+
+        # 读取所有资金流向文件并合并
+        dfs = []
+        for fname in tqdm(all_files, desc="Loading moneyflow data"):
+            filepath = os.path.join(self.moneyflow_dir, fname)
+            df_day = pd.read_csv(filepath)
+            dfs.append(df_day)
+
+        self.df_moneyflow = pd.concat(dfs, ignore_index=True)
+        self.df_moneyflow['trade_date'] = self.df_moneyflow['trade_date'].astype(str)
+        self.df_moneyflow = self.df_moneyflow.sort_values(['ts_code', 'trade_date'])
+
+        print(f"加载资金流向数据: {len(self.df_moneyflow)} 条记录")
+
+    # =========================================================
+    # 加载基本面数据
+    # =========================================================
+    def load_fundamental_data(self):
+        """加载基本面数据（文件夹形式）"""
+        if not os.path.exists(self.fundamental_dir):
+            print(f"警告：未找到基本面数据目录 {self.fundamental_dir}")
+            self.df_fundamental = None
+            return
+
+        all_files = [f for f in os.listdir(self.fundamental_dir) if f.endswith('.csv')]
+        if not all_files:
+            print("警告：基本面目录为空")
+            self.df_fundamental = None
+            return
+
+        # 读取所有基本面文件并合并
+        dfs = []
+        for fname in tqdm(all_files, desc="Loading fundamental data"):
+            filepath = os.path.join(self.fundamental_dir, fname)
+            df_day = pd.read_csv(filepath)
+            dfs.append(df_day)
+
+        self.df_fundamental = pd.concat(dfs, ignore_index=True)
+        self.df_fundamental['trade_date'] = self.df_fundamental['trade_date'].astype(str)
+        if 'ann_date' in self.df_fundamental.columns:
+            self.df_fundamental['ann_date'] = self.df_fundamental['ann_date'].astype(str)
+        self.df_fundamental = self.df_fundamental.sort_values(['ts_code', 'trade_date'])
+
+        print(f"加载基本面数据: {len(self.df_fundamental)} 条记录")
 
     # =========================================================
     # 加载数据
@@ -207,6 +273,18 @@ class DataProcessor:
             df = df[
                 ~df['ts_code'].isin(bj_codes)
             ]
+
+        # =====================================================
+        # 加载行业代码（用于后续行业中性化）
+        # =====================================================
+        basic = pd.read_csv(self.basic_path)
+        self.industry_map = dict(zip(basic['ts_code'], basic.get('industry_code', 'unknown')))
+        df['industry_code'] = df['ts_code'].map(self.industry_map).fillna('unknown')
+
+        # =====================================================
+        # 过滤极端交易日：停牌、一字涨停/跌停
+        # =====================================================
+        df = self._filter_extreme_days(df)
 
         # =====================================================
         # 股票池
@@ -373,21 +451,137 @@ class DataProcessor:
         return df
 
     # =========================================================
+    # 过滤极端交易日（停牌、一字涨停/跌停）
+    # =========================================================
+    def _filter_extreme_days(self, df):
+        """
+        过滤极端交易日样本：
+        1. 停牌股票（volume == 0 或存在缺失值）
+        2. 一字涨停/跌停（open == close == high == low 且涨跌幅显著）
+        
+        注意：这里只是标记/过滤单日数据，不破坏其他正常样本的30天连续序列构建
+        """
+        n_before = len(df)
+        
+        df = df.copy()
+        
+        # 标记停牌：volume == 0 或 open/high/low/close 存在缺失
+        suspended = (
+            (df['vol'] == 0) | 
+            (df[['open', 'high', 'low', 'close']].isna().any(axis=1))
+        )
+        
+        # 标记一字涨跌停：开盘价=收盘价=最高价=最低价 且 涨跌幅绝对值 >= 9.5%
+        # A股涨跌停幅度通常为10%（或20%），使用9.5%作为阈值以捕捉边界情况
+        limit_up = (
+            (df['open'] == df['close']) & 
+            (df['close'] == df['high']) & 
+            (df['low'] == df['high']) & 
+            (df['pct_chg'] >= 9.5)
+        )
+        
+        limit_down = (
+            (df['open'] == df['close']) & 
+            (df['close'] == df['high']) & 
+            (df['low'] == df['high']) & 
+            (df['pct_chg'] <= -9.5)
+        )
+        
+        # 合并所有过滤条件
+        extreme_mask = suspended | limit_up | limit_down
+        
+        n_suspended = suspended.sum()
+        n_limit_up = limit_up.sum()
+        n_limit_down = limit_down.sum()
+        n_filtered = extreme_mask.sum()
+        
+        # 打印过滤统计
+        print(f"极端交易日过滤:")
+        print(f"  - 停牌样本: {n_suspended}")
+        print(f"  - 涨停样本: {n_limit_up}")
+        print(f"  - 跌停样本: {n_limit_down}")
+        print(f"  - 总计过滤: {n_filtered} / {n_before} ({100*n_filtered/n_before:.2f}%)")
+        
+        # 过滤掉极端样本
+        df = df[~extreme_mask]
+        
+        return df
+
+    # =========================================================
+    # 资金流特征工程
+    # =========================================================
+    def add_moneyflow_features(self):
+        self.df['super_large_net'] = self.df['super_large_net'].fillna(0)
+        self.df['large_net'] = self.df['large_net'].fillna(0)
+        self.df['medium_net'] = self.df['medium_net'].fillna(0)
+        self.df['small_net'] = self.df['small_net'].fillna(0)
+        self.df['total_turnover'] = self.df['total_turnover'].fillna(0)
+
+        self.df['mf_main_force_ratio'] = (self.df['super_large_net'] + self.df['large_net']) / (self.df['total_turnover'] + 1e-10)
+        self.df['mf_retail_ratio'] = (self.df['medium_net'] + self.df['small_net']) / (self.df['total_turnover'] + 1e-10)
+
+        self.feature_cols = self.feature_cols + ['mf_main_force_ratio', 'mf_retail_ratio']
+
+    # =========================================================
     # 截面Z-Score标准化（Cross-sectional Normalization）
     # =========================================================
-    def cross_sectional_normalize(self, df):
-        """对所有输入特征在截面上进行Z-Score标准化"""
+    def cross_sectional_normalize(self, df, industry_neutral=False):
+        """
+        对所有输入特征在截面上进行Z-Score标准化
+        
+        参数:
+            df: 输入数据
+            industry_neutral: 是否对基本面因子进行行业中性化处理
+                             如果为True，将对PE、PB、ROE等因子按行业分组做Z-Score
+        """
         feature_cols = self.feature_cols
         
-        def normalize_group(group):
-            for col in feature_cols:
-                if col in group.columns:
-                    mean_val = group[col].mean()
-                    std_val = group[col].std()
-                    group[col] = (group[col] - mean_val) / (std_val + 1e-10)
-            return group
-        
-        df = df.groupby(level='trade_date', group_keys=False).apply(normalize_group)
+        if industry_neutral and 'industry_code' in df.columns:
+            # 分离基本面因子和其他因子
+            fundamental_factors = ['pe_ttm', 'pb', 'roe', 'ps_ttm', 'pcf_ncf', 'pcf_ocf']
+            fundamental_cols = [col for col in fundamental_factors if col in feature_cols]
+            other_cols = [col for col in feature_cols if col not in fundamental_cols]
+            
+            print(f"行业中性化处理:")
+            print(f"  - 基本面因子 ({len(fundamental_cols)}个): {fundamental_cols}")
+            print(f"  - 其他因子 ({len(other_cols)}个): {other_cols}")
+            
+            # 1. 对其他因子进行全市场截面Z-Score
+            if other_cols:
+                def normalize_other(group):
+                    for col in other_cols:
+                        if col in group.columns:
+                            mean_val = group[col].mean()
+                            std_val = group[col].std()
+                            group[col] = (group[col] - mean_val) / (std_val + 1e-10)
+                    return group
+                
+                df = df.groupby(level='trade_date', group_keys=False).apply(normalize_other)
+            
+            # 2. 对基本面因子进行行业中性化Z-Score
+            if fundamental_cols:
+                def neutralize_fundamental(group):
+                    for col in fundamental_cols:
+                        if col in group.columns:
+                            # 按行业分组计算Z-Score
+                            industry_means = group.groupby('industry_code')[col].transform('mean')
+                            industry_stds = group.groupby('industry_code')[col].transform('std')
+                            group[col] = (group[col] - industry_means) / (industry_stds + 1e-10)
+                    return group
+                
+                df = df.groupby(level='trade_date', group_keys=False).apply(neutralize_fundamental)
+                print(f"  - 基本面因子已完成行业中性化")
+        else:
+            # 标准全市场截面Z-Score
+            def normalize_group(group):
+                for col in feature_cols:
+                    if col in group.columns:
+                        mean_val = group[col].mean()
+                        std_val = group[col].std()
+                        group[col] = (group[col] - mean_val) / (std_val + 1e-10)
+                return group
+            
+            df = df.groupby(level='trade_date', group_keys=False).apply(normalize_group)
         
         print("截面Z-Score标准化完成")
         return df
@@ -524,114 +718,116 @@ class DataProcessor:
         val_start = val_date_range[0].replace('-', '')
         val_end = val_date_range[1].replace('-', '')
 
-        # =====================================================
-        # 按股票分组
-        # =====================================================
+        n_features = len(feature_cols)
+
+        # 第一遍：计数
+        train_count = 0
+        val_count = 0
         grouped = df.groupby('ts_code')
 
-        # 【内存优化】直接分开存储训练集和验证集
-        X_train_list = []
-        y_op_train_list = []
-        y_lp_train_list = []
-        y_hp_train_list = []
-        dates_train_list = []
-        stocks_train_list = []
-        current_close_train_list = []
-
-        X_val_list = []
-        y_op_val_list = []
-        y_lp_val_list = []
-        y_hp_val_list = []
-        dates_val_list = []
-        stocks_val_list = []
-        current_close_val_list = []
-
-        for code, group in tqdm(
-            grouped,
-            desc="Creating sequences"
-        ):
-
+        for code, group in tqdm(grouped, desc="Counting samples"):
             group = group.sort_index()
+            dates_arr = group.index.get_level_values('trade_date').values
+            T = len(group)
+            for i in range(T - window_len):
+                date = dates_arr[i + window_len - 1]
+                if train_start <= date <= train_end:
+                    train_count += 1
+                elif val_start <= date <= val_end:
+                    val_count += 1
 
-            # 提取特征矩阵 (T, F)
+        print(f"Train samples: {train_count}")
+        print(f"Val samples: {val_count}")
+
+        import tempfile
+        tmpdir = os.path.join(self.data_root, '.lstm_cache')
+        os.makedirs(tmpdir, exist_ok=True)
+        print(f"[INFO] memmap 缓存目录: {tmpdir}")
+
+        def _make_memmap(shape, dtype, suffix):
+            path = os.path.join(tmpdir, f'lstm_{suffix}_{os.getpid()}.dat')
+            return np.memmap(path, dtype=dtype, mode='w+', shape=shape), path
+
+        X_train, _  = _make_memmap((train_count, window_len, n_features), np.float32, 'X_train') if train_count > 0 else (np.array([], dtype=np.float32).reshape(0, window_len, n_features), None)
+        y_op_train, _  = _make_memmap((train_count, 1), np.float32, 'yop_train') if train_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        y_lp_train, _  = _make_memmap((train_count, 1), np.float32, 'ylp_train') if train_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        y_hp_train, _  = _make_memmap((train_count, 1), np.float32, 'yhp_train') if train_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        dates_train_mem, dates_train_path = _make_memmap((train_count,), dtype='U10', suffix='dates_train') if train_count > 0 else (np.array([], dtype='U10'), None)
+        stocks_train_mem, stocks_train_path = _make_memmap((train_count,), dtype='U10', suffix='stocks_train') if train_count > 0 else (np.array([], dtype='U10'), None)
+        close_train_mem, close_train_path = _make_memmap((train_count, 1), np.float32, 'close_train') if train_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+
+        X_val, _  = _make_memmap((val_count, window_len, n_features), np.float32, 'X_val') if val_count > 0 else (np.array([], dtype=np.float32).reshape(0, window_len, n_features), None)
+        y_op_val, _  = _make_memmap((val_count, 1), np.float32, 'yop_val') if val_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        y_lp_val, _  = _make_memmap((val_count, 1), np.float32, 'ylp_val') if val_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        y_hp_val, _  = _make_memmap((val_count, 1), np.float32, 'yhp_val') if val_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+        dates_val_mem, dates_val_path = _make_memmap((val_count,), dtype='U10', suffix='dates_val') if val_count > 0 else (np.array([], dtype='U10'), None)
+        stocks_val_mem, stocks_val_path = _make_memmap((val_count,), dtype='U10', suffix='stocks_val') if val_count > 0 else (np.array([], dtype='U10'), None)
+        close_val_mem, close_val_path  = _make_memmap((val_count, 1), np.float32, 'close_val') if val_count > 0 else (np.array([], dtype=np.float32).reshape(0, 1), None)
+
+        # 第二遍：写入
+        train_idx = 0
+        val_idx = 0
+
+        for code, group in tqdm(grouped, desc="Writing sequences"):
+            group = group.sort_index()
             features = group[feature_cols].values
-
-            # 提取标签
             y_op = group['label_op'].values
             y_lp = group['label_lp'].values
             y_hp = group['label_hp'].values
-
-            # 提取元数据
-            dates = group.index.get_level_values('trade_date').values
+            dates_arr = group.index.get_level_values('trade_date').values
             current_closes = group['close'].values
-
-            # 滑动窗口
             T = len(group)
+
             for i in range(T - window_len):
-                # 输入窗口
-                x = features[i:i+window_len]
+                x = features[i:i + window_len]
+                op = y_op[i + window_len - 1]
+                lp = y_lp[i + window_len - 1]
+                hp = y_hp[i + window_len - 1]
+                date = dates_arr[i + window_len - 1]
+                current_close = current_closes[i + window_len - 1]
 
-                # 标签（三个维度）
-                op = y_op[i+window_len-1]
-                lp = y_lp[i+window_len-1]
-                hp = y_hp[i+window_len-1]
-
-                # 元数据
-                date = dates[i+window_len-1]
-
-                current_close = current_closes[i+window_len-1]
-
-                # 检查标签是否有效
                 if np.isnan(op) or np.isnan(lp) or np.isnan(hp):
                     continue
-
-                # 检查输入是否有效
                 if np.isnan(x).any():
                     continue
 
-                # 【内存优化】在生成时就按日期范围分割
                 if train_start <= date <= train_end:
-                    X_train_list.append(x)
-                    y_op_train_list.append(op)
-                    y_lp_train_list.append(lp)
-                    y_hp_train_list.append(hp)
-                    dates_train_list.append(date)
-                    stocks_train_list.append(code)
-                    current_close_train_list.append(current_close)
+                    X_train[train_idx] = x
+                    y_op_train[train_idx] = op
+                    y_lp_train[train_idx] = lp
+                    y_hp_train[train_idx] = hp
+                    dates_train_mem[train_idx] = str(date)
+                    stocks_train_mem[train_idx] = str(code)
+                    close_train_mem[train_idx] = current_close
+                    train_idx += 1
                 elif val_start <= date <= val_end:
-                    X_val_list.append(x)
-                    y_op_val_list.append(op)
-                    y_lp_val_list.append(lp)
-                    y_hp_val_list.append(hp)
-                    dates_val_list.append(date)
-                    stocks_val_list.append(code)
-                    current_close_val_list.append(current_close)
+                    X_val[val_idx] = x
+                    y_op_val[val_idx] = op
+                    y_lp_val[val_idx] = lp
+                    y_hp_val[val_idx] = hp
+                    dates_val_mem[val_idx] = str(date)
+                    stocks_val_mem[val_idx] = str(code)
+                    close_val_mem[val_idx] = current_close
+                    val_idx += 1
 
-        # =====================================================
-        # 转换为numpy数组（仅转换需要的数据）
-        # =====================================================
-        X_train = np.array(X_train_list, dtype=np.float32)
-        y_op_train = np.array(y_op_train_list, dtype=np.float32).reshape(-1, 1)
-        y_lp_train = np.array(y_lp_train_list, dtype=np.float32).reshape(-1, 1)
-        y_hp_train = np.array(y_hp_train_list, dtype=np.float32).reshape(-1, 1)
-        dates_train = np.array(dates_train_list, dtype=str)
-        stocks_train = np.array(stocks_train_list, dtype=str)
-        current_close_train = np.array(current_close_train_list, dtype=np.float32).reshape(-1, 1)
+        memo = {
+            'dates_train_path': dates_train_path,
+            'stocks_train_path': stocks_train_path,
+            'close_train_path': close_train_path,
+            'dates_val_path': dates_val_path,
+            'stocks_val_path': stocks_val_path,
+            'close_val_path': close_val_path,
+            'train_count': train_count,
+            'val_count': val_count,
+        }
+        self._memmap_meta = memo
 
-        X_val = np.array(X_val_list, dtype=np.float32)
-        y_op_val = np.array(y_op_val_list, dtype=np.float32).reshape(-1, 1)
-        y_lp_val = np.array(y_lp_val_list, dtype=np.float32).reshape(-1, 1)
-        y_hp_val = np.array(y_hp_val_list, dtype=np.float32).reshape(-1, 1)
-        dates_val = np.array(dates_val_list, dtype=str)
-        stocks_val = np.array(stocks_val_list, dtype=str)
-        current_close_val = np.array(current_close_val_list, dtype=np.float32).reshape(-1, 1)
-
-        print(
-            f"Train samples: {len(X_train)}"
-        )
-        print(
-            f"Val samples: {len(X_val)}"
-        )
+        dates_train = np.array(dates_train_mem, dtype=str) if train_count > 0 else np.array([], dtype=str)
+        stocks_train = np.array(stocks_train_mem, dtype=str) if train_count > 0 else np.array([], dtype=str)
+        current_close_train = np.array(close_train_mem, dtype=np.float32).reshape(-1, 1) if train_count > 0 else np.array([], dtype=np.float32).reshape(0, 1)
+        dates_val = np.array(dates_val_mem, dtype=str) if val_count > 0 else np.array([], dtype=str)
+        stocks_val = np.array(stocks_val_mem, dtype=str) if val_count > 0 else np.array([], dtype=str)
+        current_close_val = np.array(close_val_mem, dtype=np.float32).reshape(-1, 1) if val_count > 0 else np.array([], dtype=np.float32).reshape(0, 1)
 
         return (
             X_train, y_op_train, y_lp_train, y_hp_train,
@@ -648,56 +844,50 @@ class DataProcessor:
         X_train,
         X_val
     ):
-        """
-        对输入特征进行时间序列上的标准化
-        (在截面上已做过Z-Score，这里对时间维度做标准化)
-        
-        使用批量处理提高效率
-        """
+        if len(X_train) == 0 and len(X_val) == 0:
+            return X_train, X_val
 
-        N_train, T_train, F_train = X_train.shape
-        N_val, T_val, F_val = X_val.shape
+        if len(X_train) == 0:
+            fit_data = X_val
+        else:
+            fit_data = X_train
 
-        assert F_train == F_val
+        N_fit, T_fit, F_fit = fit_data.shape
 
-        # =====================================================
-        # 采样拟合 scaler（避免全量数据）
-        # =====================================================
         self.scaler = StandardScaler()
 
-        sample_ratio = min(1.0, 50000 / N_train)
-        n_sample = max(10000, int(N_train * sample_ratio))
+        sample_ratio = min(1.0, 50000 / max(1, N_fit))
+        n_sample = max(1000, int(N_fit * sample_ratio))
+        n_sample = min(n_sample, N_fit)
 
         np.random.seed(42)
-        sample_indices = np.random.choice(N_train, n_sample, replace=False)
+        sample_indices = np.random.choice(N_fit, n_sample, replace=False)
 
-        sample_flat = X_train[sample_indices].reshape(-1, F_train)
+        sample_flat = fit_data[sample_indices].reshape(-1, F_fit)
         self.scaler.fit(sample_flat)
         del sample_flat
 
-        # =====================================================
-        # 批量处理训练集：一次性处理所有样本
-        # =====================================================
-        print(f"标准化训练集: {X_train.shape}")
-        X_train_flat = X_train.reshape(-1, F_train)
-        X_train_flat[:] = self.scaler.transform(X_train_flat)
-        X_train = X_train_flat.reshape(N_train, T_train, F_train)
+        chunk_size = 2000
 
-        # =====================================================
-        # 批量处理验证集
-        # =====================================================
+        def _transform_inplace(X, name):
+            N, T, F = X.shape
+            print(f"标准化{name}: {X.shape}（分批处理，每批 {chunk_size} 样本）")
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                chunk_flat = X[start:end].reshape(-1, F)
+                chunk_flat[:] = self.scaler.transform(chunk_flat)
+                X[start:end] = chunk_flat.reshape(end - start, T, F)
+            return X
+
+        if len(X_train) > 0:
+            X_train = _transform_inplace(X_train, "训练集")
+
         if len(X_val) > 0:
-            print(f"标准化验证集: {X_val.shape}")
-            X_val_flat = X_val.reshape(-1, F_val)
-            X_val_flat[:] = self.scaler.transform(X_val_flat)
-            X_val = X_val_flat.reshape(N_val, T_val, F_val)
+            X_val = _transform_inplace(X_val, "验证集")
         else:
             X_val = np.array([])
 
-        return (
-            X_train,
-            X_val
-        )
+        return X_train, X_val
 
     # =========================================================
     # pipeline - 支持多目标标签
@@ -716,7 +906,10 @@ class DataProcessor:
         val_range=(
             '2025-04-01',
             '2025-06-30'
-        )
+        ),
+        industry_neutral=False,
+        use_fundamental=False,
+        use_moneyflow=False
     ):
 
         self.load_data(
@@ -725,14 +918,75 @@ class DataProcessor:
             stock_pool=stock_pool
         )
 
+        # 根据开关加载基本面和资金流数据
+        if use_fundamental:
+            self.load_fundamental_data()
+            if self.df_fundamental is not None:
+                print(f"基本面数据: {len(self.df_fundamental)} 条记录")
+
+        if use_moneyflow:
+            self.load_moneyflow_data()
+            if self.df_moneyflow is not None:
+                print(f"资金流数据: {len(self.df_moneyflow)} 条记录")
+
         self.select_features()
 
         self.construct_labels(
             horizon=horizon
         )
 
-        # 截面Z-Score标准化
-        self.df = self.cross_sectional_normalize(self.df)
+        # =====================================================
+        # 合并基本面和资金流数据（仅当启用时）
+        # =====================================================
+        merged = self.df.copy()
+
+        extra_feature_cols = []
+
+        if use_fundamental and self.df_fundamental is not None:
+            fund_cols = ['trade_date', 'ts_code', 'pe_ttm', 'pb', 'roe']
+            available_cols = [c for c in fund_cols if c in self.df_fundamental.columns]
+            if available_cols:
+                value_cols = [c for c in available_cols if c not in ['trade_date', 'ts_code']]
+                merged = merged.merge(
+                    self.df_fundamental[available_cols],
+                    on=['trade_date', 'ts_code'],
+                    how='left'
+                )
+                extra_feature_cols.extend(value_cols)
+                print(f"合并基本面特征: {len(value_cols)} 个")
+
+        if use_moneyflow and self.df_moneyflow is not None:
+            mf_cols = ['trade_date', 'ts_code', 'super_large_net', 'large_net', 'medium_net', 'small_net', 'total_turnover']
+            available_cols = [c for c in mf_cols if c in self.df_moneyflow.columns]
+            if available_cols:
+                value_cols = [c for c in available_cols if c not in ['trade_date', 'ts_code']]
+                merged = merged.merge(
+                    self.df_moneyflow[available_cols],
+                    on=['trade_date', 'ts_code'],
+                    how='left'
+                )
+                extra_feature_cols.extend(value_cols)
+                print(f"合并资金流特征: {len(value_cols)} 个")
+
+        if use_moneyflow and 'super_large_net' in merged.columns:
+            self.add_moneyflow_features()
+            print("已添加资金流特征")
+
+        if extra_feature_cols:
+            for col in extra_feature_cols:
+                if col in merged.columns:
+                    merged[col] = merged[col].fillna(merged[col].median() if merged[col].notna().any() else 0)
+            self.feature_cols = self.feature_cols + extra_feature_cols
+            print(f"更新特征维度: {len(self.feature_cols)} 维（含 {len(extra_feature_cols)} 个额外特征）")
+
+        self.df = merged
+
+        # 确保 trade_date 和 ts_code 设置为索引（用于截面标准化）
+        if 'trade_date' in self.df.columns:
+            self.df = self.df.set_index(['trade_date', 'ts_code'])
+
+        # 截面Z-Score标准化（支持行业中性化）
+        self.df = self.cross_sectional_normalize(self.df, industry_neutral=industry_neutral)
 
         # 多目标标签：OP、LP、HP，以及日期、股票代码、收盘价
         X_train, y_op_train, y_lp_train, y_hp_train, dates_train, stocks_train, current_close_train, \

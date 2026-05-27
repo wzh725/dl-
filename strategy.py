@@ -18,24 +18,15 @@ class TradingStrategy:
         hidden_dim=64,
         num_layers=3,
         dropout=0.3,
+        fc_dropout=0.5,
         bidirectional=False,
         label_scale=100.0
     ):
-        """
-        初始化交易策略
-
-        Args:
-            model_path: 模型文件路径
-            hidden_dim: LSTM隐藏层维度
-            num_layers: LSTM层数
-            dropout: Dropout概率
-            bidirectional: 是否使用双向LSTM
-            label_scale: 标签缩放因子，必须与训练时一致（用于逆缩放预测值）
-        """
         self.model_path = model_path
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dropout = dropout
+        self.fc_dropout = fc_dropout
         self.bidirectional = bidirectional
         self.label_scale = label_scale
         self.model = None
@@ -43,18 +34,13 @@ class TradingStrategy:
         self.scaler = None
 
     def load_model(self, input_dim=30):
-        """
-        加载训练好的多值关联残差神经网络
-
-        Args:
-            input_dim: 输入特征维度
-        """
         try:
             self.model = AssociatedResidualNet(
                 input_dim=input_dim,
                 hidden_dim=self.hidden_dim,
                 num_layers=self.num_layers,
                 dropout=self.dropout,
+                fc_dropout=self.fc_dropout,
                 bidirectional=self.bidirectional
             ).to(self.device)
 

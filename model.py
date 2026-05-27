@@ -21,7 +21,6 @@ class ResidualLSTMBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.bidirectional = bidirectional
 
-        # LSTM层
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -31,42 +30,26 @@ class ResidualLSTMBlock(nn.Module):
             bidirectional=bidirectional
         )
 
-        # Dropout
         self.dropout = nn.Dropout(dropout)
 
-        # LayerNorm
         lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
         self.layer_norm = nn.LayerNorm(lstm_output_dim)
 
-        # 如果输入维度不等于输出维度，需要投影
         if input_dim != lstm_output_dim:
             self.projection = nn.Linear(input_dim, lstm_output_dim)
         else:
             self.projection = None
 
     def forward(self, x):
-        """
-        前向传播
-        Args:
-            x: (batch, seq_len, input_dim)
-        Returns:
-            out: (batch, seq_len, lstm_output_dim)
-        """
-        # LSTM输出
         lstm_out, _ = self.lstm(x)
-
-        # Dropout
         lstm_out = self.dropout(lstm_out)
 
-        # 残差连接
         if self.projection is not None:
             residual = self.projection(x)
         else:
             residual = x
 
-        # LayerNorm
         out = self.layer_norm(lstm_out + residual)
-
         return out
 
 
@@ -86,6 +69,7 @@ class AssociatedResidualNet(nn.Module):
         hidden_dim=64,
         num_layers=3,
         dropout=0.3,
+        fc_dropout=0.5,
         bidirectional=False
     ):
         super(AssociatedResidualNet, self).__init__()
@@ -94,15 +78,12 @@ class AssociatedResidualNet(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dropout = dropout
+        self.fc_dropout = fc_dropout
         self.bidirectional = bidirectional
 
-        # LSTM输出维度
         lstm_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
-        # ========== 分支1：OP分支 ==========
-        # 使用多个ResidualLSTMBlock
         self.op_blocks = nn.ModuleList()
-        # 第一层：输入原始特征
         self.op_blocks.append(
             ResidualLSTMBlock(
                 input_dim=input_dim,
@@ -112,7 +93,6 @@ class AssociatedResidualNet(nn.Module):
                 bidirectional=bidirectional
             )
         )
-        # 后续层：输入等于上一层输出
         for _ in range(num_layers - 1):
             self.op_blocks.append(
                 ResidualLSTMBlock(
@@ -123,11 +103,10 @@ class AssociatedResidualNet(nn.Module):
                     bidirectional=bidirectional
                 )
             )
-        # OP输出层
+        self.op_bn = nn.BatchNorm1d(lstm_out_dim)
+        self.op_dropout = nn.Dropout(fc_dropout)
         self.op_fc = nn.Linear(lstm_out_dim, 1)
 
-        # ========== 分支2：LP分支 ==========
-        # 输入维度 = 原始特征 + OP预测输出
         lp_input_dim = input_dim + 1
         self.lp_blocks = nn.ModuleList()
         self.lp_blocks.append(
@@ -149,11 +128,10 @@ class AssociatedResidualNet(nn.Module):
                     bidirectional=bidirectional
                 )
             )
-        # LP输出层
+        self.lp_bn = nn.BatchNorm1d(lstm_out_dim)
+        self.lp_dropout = nn.Dropout(fc_dropout)
         self.lp_fc = nn.Linear(lstm_out_dim, 1)
 
-        # ========== 分支3：HP分支 ==========
-        # 输入维度 = 原始特征 + OP预测输出 + LP预测输出
         hp_input_dim = input_dim + 2
         self.hp_blocks = nn.ModuleList()
         self.hp_blocks.append(
@@ -175,33 +153,22 @@ class AssociatedResidualNet(nn.Module):
                     bidirectional=bidirectional
                 )
             )
-        # HP输出层
+        self.hp_bn = nn.BatchNorm1d(lstm_out_dim)
+        self.hp_dropout = nn.Dropout(fc_dropout)
         self.hp_fc = nn.Linear(lstm_out_dim, 1)
 
     def forward(self, x):
-        """
-        前向传播
-        Args:
-            x: (batch, seq_len, input_dim) 原始特征
-        Returns:
-            pred_op: (batch, 1) 预测的开盘价变化率
-            pred_lp: (batch, 1) 预测的最低价变化率
-            pred_hp: (batch, 1) 预测的最高价变化率
-        """
         batch_size = x.shape[0]
         seq_len = x.shape[1]
 
-        # ========== 分支1：OP分支 ==========
         op_out = x
         for block in self.op_blocks:
             op_out = block(op_out)
-        # 取最后一个时间步
         op_last = op_out[:, -1, :]
+        op_last = self.op_bn(op_last)
+        op_last = self.op_dropout(op_last)
         pred_op = self.op_fc(op_last)
 
-        # ========== 分支2：LP分支 ==========
-        # 构建LP输入：原始特征 + OP预测（在时间维度上广播）
-        # pred_op: (batch, 1) -> (batch, seq_len, 1)
         pred_op_expanded = pred_op.unsqueeze(1).expand(-1, seq_len, 1)
         lp_input = torch.cat([x, pred_op_expanded], dim=-1)
 
@@ -209,10 +176,10 @@ class AssociatedResidualNet(nn.Module):
         for block in self.lp_blocks:
             lp_out = block(lp_out)
         lp_last = lp_out[:, -1, :]
+        lp_last = self.lp_bn(lp_last)
+        lp_last = self.lp_dropout(lp_last)
         pred_lp = self.lp_fc(lp_last)
 
-        # ========== 分支3：HP分支 ==========
-        # 构建HP输入：原始特征 + OP预测 + LP预测
         pred_lp_expanded = pred_lp.unsqueeze(1).expand(-1, seq_len, 1)
         hp_input = torch.cat([x, pred_op_expanded, pred_lp_expanded], dim=-1)
 
@@ -220,6 +187,8 @@ class AssociatedResidualNet(nn.Module):
         for block in self.hp_blocks:
             hp_out = block(hp_out)
         hp_last = hp_out[:, -1, :]
+        hp_last = self.hp_bn(hp_last)
+        hp_last = self.hp_dropout(hp_last)
         pred_hp = self.hp_fc(hp_last)
 
         return pred_op, pred_lp, pred_hp
@@ -360,49 +329,42 @@ class JointDirectionalLoss(nn.Module):
 # 运行示例：使用虚拟数据进行前向传播和Loss计算
 # =========================================================
 if __name__ == "__main__":
-    # 超参数设置
     input_dim = 30
     hidden_dim = 64
     num_layers = 3
     dropout = 0.3
+    fc_dropout = 0.5
     bidirectional = True
     batch_size = 32
     seq_len = 30
 
-    # 创建模型实例
     model = AssociatedResidualNet(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         dropout=dropout,
+        fc_dropout=fc_dropout,
         bidirectional=bidirectional
     )
 
-    # 创建虚拟输入数据 (batch_size, seq_len, input_dim)
     x_dummy = torch.randn(batch_size, seq_len, input_dim)
 
-    # 创建虚拟目标标签
     op_target = torch.randn(batch_size, 1) * 0.05
     lp_target = torch.randn(batch_size, 1) * 0.05
     hp_target = torch.randn(batch_size, 1) * 0.05
 
-    # 前向传播
     pred_op, pred_lp, pred_hp = model(x_dummy)
 
-    # 计算损失
     criterion = JointDirectionalLoss(penalty_weight=1.5)
     loss = criterion(pred_op, pred_lp, pred_hp, op_target, lp_target, hp_target)
 
-    # 输出结果
     print(f"模型结构:\n{model}")
     print(f"\n输入形状: {x_dummy.shape}")
     print(f"预测输出形状: {pred_op.shape}, {pred_lp.shape}, {pred_hp.shape}")
     print(f"\n多任务联合损失: {loss.item():.6f}")
 
-    # 展示优化器绑定
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
-    # 演示训练步骤
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

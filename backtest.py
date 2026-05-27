@@ -41,10 +41,16 @@ def main():
                         help='LSTM层数（必须与训练时一致）')
     parser.add_argument('--dropout', type=float, default=0.3,
                         help='Dropout概率（必须与训练时一致）')
+    parser.add_argument('--fc_dropout', type=float, default=0.5,
+                        help='输出层Dropout概率（必须与训练时一致）')
     parser.add_argument('--bidirectional', action='store_true',
                         help='是否使用双向LSTM（必须与训练时一致）')
     parser.add_argument('--label_scale', type=float, default=100.0,
                         help='标签缩放因子（必须与训练时一致）')
+    parser.add_argument('--use_fundamental', action='store_true', default=False,
+                        help='是否使用基本面数据（必须与训练时一致）')
+    parser.add_argument('--use_moneyflow', action='store_true', default=False,
+                        help='是否使用资金流数据（必须与训练时一致）')
     args = parser.parse_args()
 
     print("="*60)
@@ -63,30 +69,42 @@ def main():
     print(f"LSTM隐藏层维度: {args.hidden_dim}")
     print(f"LSTM层数: {args.num_layers}")
     print(f"Dropout概率: {args.dropout}")
+    print(f"FC Dropout概率: {args.fc_dropout}")
     print(f"是否双向LSTM: {'是' if args.bidirectional else '否'}")
     print(f"标签缩放因子: {args.label_scale}")
+    print(f"使用基本面数据: {'是' if args.use_fundamental else '否'}")
+    print(f"使用资金流数据: {'是' if args.use_moneyflow else '否'}")
     print("="*60)
 
     # 加载数据
     print("\n[步骤1] 加载数据...")
     try:
         from data_processor import DataProcessor
-        
+
+        data_start = min(args.train_start, args.val_start)
+        data_end = max(args.train_end, args.val_end)
+        print(f"[INFO] 自动推导数据加载范围: {data_start} ~ {data_end}")
+        print(f"[INFO] 训练区间: {args.train_start} ~ {args.train_end}")
+        print(f"[INFO] 验证区间: {args.val_start} ~ {args.val_end}")
+
         processor = DataProcessor(data_root=args.data_path)
         X_train, y_op_train, y_lp_train, y_hp_train, dates_train, stocks_train, current_close_train, \
         X_val, y_op_val, y_lp_val, y_hp_val, dates_val, stocks_val, current_close_val = processor.run_pipeline(
-            start_date=args.start_date,
-            end_date=args.end_date,
+            start_date=data_start,
+            end_date=data_end,
             stock_pool=args.stock_pool,
             window_len=args.seq_len,
             horizon=1,
             train_range=(args.train_start, args.train_end),
-            val_range=(args.val_start, args.val_end)
+            val_range=(args.val_start, args.val_end),
+            use_fundamental=args.use_fundamental,
+            use_moneyflow=args.use_moneyflow
         )
         
         print(f"训练集样本数: {len(X_train)}")
         print(f"验证集样本数: {len(X_val)}")
-        print(f"特征维度: {X_train.shape[-1]}")
+        input_dim = X_val.shape[-1] if len(X_val) > 0 else (X_train.shape[-1] if len(X_train) > 0 else 33)
+        print(f"特征维度: {input_dim}")
         
     except Exception as e:
         print(f"[ERROR] 数据加载失败: {str(e)}")
@@ -105,20 +123,24 @@ def main():
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             dropout=args.dropout,
+            fc_dropout=args.fc_dropout,
             bidirectional=args.bidirectional,
             label_scale=args.label_scale
         )
         
-        success = strategy.load_model(input_dim=X_val.shape[-1])
+        success = strategy.load_model(input_dim=input_dim)
         if not success:
             print("[ERROR] 模型加载失败")
             print("[提示] 请检查以下参数是否与训练时一致：")
             print(f"       - hidden_dim: 当前设置为 {args.hidden_dim}")
             print(f"       - num_layers: 当前设置为 {args.num_layers}")
             print(f"       - dropout: 当前设置为 {args.dropout}")
+            print(f"       - fc_dropout: 当前设置为 {args.fc_dropout}")
             print(f"       - bidirectional: 当前设置为 {args.bidirectional}")
             print(f"       - seq_len: 当前设置为 {args.seq_len}")
             print(f"       - label_scale: 当前设置为 {args.label_scale}")
+            print(f"       - use_fundamental: 当前设置为 {args.use_fundamental}")
+            print(f"       - use_moneyflow: 当前设置为 {args.use_moneyflow}")
             print("[提示] 如果您使用了不同的参数训练模型，请使用以下命令格式：")
             print("       python backtest.py --model_path ./saved_models/best_model.pth ")
             print("                          --hidden_dim 128 --num_layers 2 --dropout 0.3 --bidirectional --label_scale 100.0")
