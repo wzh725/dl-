@@ -2,6 +2,57 @@
   "init_capital": 1000000,
   "current_capital": 1000000,
   "total_value": 1000000,
-  "positions": {},
-  "last_run_date": ""
+  "positions": {
+    "603063.SH": {
+      "quantity": 291700,
+      "cost_price": 0.34,
+      "buy_date": "20260528"
+    },
+    "688623.SH": {
+      "quantity": 105300,
+      "cost_price": 0.95,
+      "buy_date": "20260528"
+    },
+    "688611.SH": {
+      "quantity": 156900,
+      "cost_price": 0.64,
+      "buy_date": "20260528"
+    },
+    "688234.SH": {
+      "quantity": 56300,
+      "cost_price": 1.78,
+      "buy_date": "20260528"
+    },
+    "688016.SH": {
+      "quantity": 107500,
+      "cost_price": 0.93,
+      "buy_date": "20260528"
+    },
+    "688359.SH": {
+      "quantity": 73100,
+      "cost_price": 1.37,
+      "buy_date": "20260528"
+    },
+    "002980.SZ": {
+      "quantity": 92300,
+      "cost_price": 1.08,
+      "buy_date": "20260528"
+    },
+    "688478.SH": {
+      "quantity": 199700,
+      "cost_price": 0.5,
+      "buy_date": "20260528"
+    },
+    "688029.SH": {
+      "quantity": 159700,
+      "cost_price": 0.63,
+      "buy_date": "20260528"
+    },
+    "603045.SH": {
+      "quantity": 217200,
+      "cost_price": 0.46,
+      "buy_date": "20260528"
+    }
+  },
+  "last_run_date": "20260528"
 }

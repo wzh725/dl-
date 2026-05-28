@@ -2,7 +2,7 @@
 chcp 65001 >nul
 title LSTM 每日交易计划
 
-set MODEL_DIR=.\saved_models\production_v1
+set MODEL_DIR=.\saved_models\live_all_6m
 set DATA_PATH=D:\zhw\A股数据
 set N_HOLD=10
 set K_REBALANCE=2

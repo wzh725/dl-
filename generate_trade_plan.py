@@ -72,7 +72,9 @@ class TradePlanGenerator:
         选出得分前 N 的股票 -> 卖出不在前 N 的持仓 -> 买入未持有的前 N 股票
         每日最多调仓 K 只
         """
-        top_n = self.df_pred.head(self.n_hold)
+        # 先筛选有效股票（价格>0），不足则从后面补充
+        valid_stocks = self.df_pred[self.df_pred['close'] > 0].head(self.n_hold + 5)
+        top_n = valid_stocks.head(self.n_hold)
         top_codes = set(top_n['ts_code'].tolist())
         top_info = {}
         for _, row in top_n.iterrows():
@@ -82,6 +84,11 @@ class TradePlanGenerator:
                 'name': row.get('name', row['ts_code'].split('.')[0]),
                 'ths_code': row.get('ths_code', row['ts_code'].split('.')[0]),
             }
+        # 检查是否有价格异常的股票被跳过
+        original_top = self.df_pred.head(self.n_hold)
+        invalid_codes = set(original_top[original_top['close'] <= 0]['ts_code'].tolist())
+        if invalid_codes:
+            print(f"[WARN] 跳过价格异常股票: {', '.join(invalid_codes)}")
 
         current_positions = self.portfolio.get('positions', {})
         current_codes = set(current_positions.keys())
